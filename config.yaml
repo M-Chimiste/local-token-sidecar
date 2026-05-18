@@ -1,0 +1,14 @@
+proxy:
+  listen_host: "localhost"
+  listen_port: 1240          # sidecar binds here; forwards to LM Studio upstream_url
+  upstream_url: "http://localhost:1234"
+
+database:
+  path: "~/.token_sidecar/tokens.db"
+
+logging:
+  level: "INFO"   # DEBUG, INFO, WARNING, ERROR
+
+launchd:
+  enabled: true
+  label: "com.athena.token-sidecar"

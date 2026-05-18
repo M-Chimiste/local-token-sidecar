@@ -1,0 +1,1 @@
+"""Token sidecar query tools — daily, hourly, and model-level token usage reports."""

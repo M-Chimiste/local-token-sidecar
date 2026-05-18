@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# UV (package manager)
+.venv/
+uv.lock       # unless you want to commit lockfile — recommended: keep it committed
+*/.venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project-specific
+*.db
+*.log
+.token_sidecar/
+
+# Local-only helper scripts (not committed)
+scripts/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
