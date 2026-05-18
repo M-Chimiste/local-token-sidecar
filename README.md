@@ -1,8 +1,8 @@
 # Token Counter Sidecar
 
-**Python:** 3.11+ · **Tests:** 56 passing · **macOS only**
+**Python:** 3.11+ · **macOS only** · **Optional central Postgres reporting**
 
-A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM API response, and writes token usage to a local SQLite database — no Docker, no containers, just Python.
+A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM API response, writes token usage to a local SQLite outbox, and can flush it to a central Postgres database for cross-machine reporting.
 
 ---
 
@@ -16,17 +16,18 @@ A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM A
 │ sidecar)     │     └─────────────────┘     └───────────────┘
 └──────────────┘              │
                               ▼
-                     ┌─────────────────┐
-                     │  SQLite         │
-                     │  ~/.token_side  │
-                     │  car/tokens.db  │
-                     └─────────────────┘
+                     ┌─────────────────┐       ┌──────────────────┐
+                     │ SQLite outbox   │ ─ ─ ▶ │ Postgres         │
+                     │ ~/.token_side   │       │ optional central │
+                     │ car/tokens.db   │       │ reporting DB     │
+                     └─────────────────┘       └──────────────────┘
 ```
 
 - Accepts OpenAI-compatible API calls (`/v1/chat/completions`, `/v1/completions`) on `localhost:1240`
 - Forwards them verbatim to LM Studio at `localhost:1234`
 - Intercepts the response, extracts `usage.prompt_tokens / completion_tokens / total_tokens`
-- Logs one row per request to SQLite with timestamps
+- Queues one local SQLite row per request with timestamps, node ID, endpoint, and HTTP status
+- Optionally flushes queued rows to central Postgres in the background, then clears local acknowledged rows
 - Returns the original upstream response unchanged — zero behaviour change for clients
 
 ---
@@ -39,6 +40,7 @@ A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM A
 | **Python** | 3.11 or newer |
 | **`uv`** | Package manager — [installation guide](https://github.com/astral-sh/uv) |
 | **macOS** | Required for the LaunchAgent auto-start feature |
+| **Postgres** | Optional; useful for multi-machine reporting over Tailscale |
 
 ---
 
@@ -46,7 +48,7 @@ A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM A
 
 ```bash
 # 1. Clone / cd into the project
-cd ~/Documents/hermes_projects/token_sidecar
+cd ~/software_projects/local-token-sidecar
 
 # 2. Run the install script — handles all setup in one step:
 ./install.sh          # interactive (confirms before loading launchd)
@@ -84,7 +86,13 @@ All settings live in `config.yaml` at the project root.
 | `proxy.listen_host` | string | `"localhost"` | Interface the proxy binds to |
 | `proxy.listen_port` | int | `1240` | Port the sidecar listens on (must be free) |
 | `proxy.upstream_url` | string | `"http://localhost:1234"` | Full URL of the LM Studio API |
+| `node.id` | string | `"local"` | Stable machine name for central reports (e.g. `athena`) |
 | `database.path` | string/path | `"~/.token_sidecar/tokens.db"` | SQLite database file path (`~` expanded) |
+| `database.central.enabled` | bool | `false` | Enable background Postgres flushing |
+| `database.central.driver` | string | `"postgres"` | Central DB driver; only `postgres` is supported |
+| `database.central.dsn_env` | string | `"TOKEN_SIDECAR_POSTGRES_DSN"` | Env var containing the sidecar writer DSN |
+| `database.central.flush_interval_seconds` | number | `5` | Background flush interval after successful attempts |
+| `database.central.batch_size` | int | `100` | Maximum queued rows per central upload batch |
 | `logging.level` | string | `"INFO"` | Log level — one of `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 Override the config path at runtime:
@@ -95,9 +103,31 @@ uv run python sidecar.py --config /path/to/custom-config.yaml
 
 ---
 
+## Central Postgres reporting
+
+On the Mac mini, install Postgres with Homebrew and create a database reachable over Tailscale. Initialise the reporting schema with:
+
+```bash
+TOKEN_SIDECAR_ADMIN_DSN='postgresql://admin@mac-mini.tailnet-name.ts.net:5432/token_sidecar' \
+  uv run python scripts/init_postgres.py
+```
+
+On each sidecar machine, set a stable `node.id`, enable central sync in `config.yaml`, and provide the writer DSN via environment variable:
+
+```bash
+export TOKEN_SIDECAR_POSTGRES_DSN='postgresql://token_sidecar_writer:password@mac-mini.tailnet-name.ts.net:5432/token_sidecar'
+uv run python sidecar.py
+```
+
+When running via LaunchAgent, `setup_launchd.py install` copies `TOKEN_SIDECAR_POSTGRES_DSN` from the current environment into the user LaunchAgent plist when central sync is enabled. The plist is written with mode `0600` in that case.
+
+See `project_docs/postgres_setup.md` for Mac mini setup notes and example SQL for writer/read-only roles.
+
+---
+
 ## Query CLI
 
-Three commands to inspect collected data. All accept `--format json` or `--format table`.
+Three commands to inspect collected data. All accept `--format json` or `--format table`, plus `--backend auto|sqlite|postgres` and `--node NODE_ID`. `auto` uses Postgres when a query/writer DSN is present, and falls back to SQLite if central reads are unavailable.
 
 ```bash
 # Today's token summary grouped by model (default: today UTC)
@@ -108,6 +138,10 @@ uv run python -m queries.summary daily --date 2026-05-17
 
 # Filter to a single model
 uv run python -m queries.summary daily --model minimax-m2.7
+
+# Query central Postgres for one machine
+TOKEN_SIDECAR_QUERY_DSN='postgresql://token_sidecar_reader:password@mac-mini.tailnet-name.ts.net:5432/token_sidecar' \
+  uv run python -m queries.summary daily --backend postgres --node athena
 
 # Hourly breakdown for a given date (--date is required)
 uv run python -m queries.summary hourly --date 2026-05-17
@@ -128,23 +162,23 @@ Date       Model             Requests   Prompt Tokens   Completion Tokens   Tota
 2026-05-17  qwen3.6-27b-mlx          4             832                 201         1,033
 ```
 
-### Querying the database directly
+### Querying the local outbox directly
 
-The SQLite file lives at `~/.token_sidecar/tokens.db`. You can query it with the `sqlite3` CLI:
+The SQLite file lives at `~/.token_sidecar/tokens.db`. With central sync disabled, it behaves like the historical local database. With central sync enabled, it is an outbox/cache and successfully uploaded rows are deleted.
 
 ```bash
 # Recent rows (last 10)
 sqlite3 ~/.token_sidecar/tokens.db \
-  "SELECT datetime(timestamp), model_name, prompt_tokens, completion_tokens, total_tokens
+  "SELECT datetime(timestamp), model, prompt_tokens, completion_tokens, total_tokens
    FROM token_usage ORDER BY id DESC LIMIT 10;"
 
 # All-time totals by model
 sqlite3 ~/.token_sidecar/tokens.db \
-  "SELECT model_name, COUNT(*) AS requests,
+  "SELECT model, COUNT(*) AS requests,
           SUM(prompt_tokens) AS prompt_toks,
           SUM(completion_tokens) AS completion_toks,
           SUM(total_tokens) AS total_toks
-   FROM token_usage GROUP BY model_name ORDER BY total_toks DESC;"
+   FROM token_usage GROUP BY model ORDER BY total_toks DESC;"
 
 # Today's usage
 sqlite3 ~/.token_sidecar/tokens.db \
@@ -186,7 +220,7 @@ Does everything: dependencies, DB init, plist generation, optional launchd load.
 If you prefer to manage the plist manually without the shell scripts:
 
 ```bash
-# Install — generates plist and loads it
+# Install — generates plist
 uv run python setup_launchd.py install
 
 # Check status (loaded / unloaded + plist path)
@@ -202,6 +236,7 @@ uv run python setup_launchd.py remove
 **What `install` does:**
 - Reads `config.yaml` for database/log paths
 - Writes `~/Library/LaunchAgents/com.athena.token-sidecar.plist`
+- Writes `TOKEN_SIDECAR_CONFIG`, and when central sync is enabled, the configured Postgres DSN env var into the plist
 - Sets `RunAtLoad: true` (starts on login) and `KeepAlive: {SuccessfulExit: false}` (restarts after crash, not clean exit)
 - Redirects stdout → `~/.token_sidecar/sidecar.log`, stderr → `~/.token_sidecar/sidecar.error.log`
 
@@ -224,14 +259,30 @@ grep upstream_url config.yaml
 ### No data appearing in SQLite
 
 ```bash
-# Is the sidecar running and responding?
-curl -s http://localhost:1240/v1/models | head -c 200
+# Is the sidecar actually listening?
+curl -s http://localhost:1240/health
+# Expected: {"status": "ok"}
 
 # Check the log file for errors
 tail ~/.token_sidecar/sidecar.error.log
 
 # Verify LM Studio is loading a model (first request after LM Studio start
 # can take 3-5 seconds while the model loads into VRAM)
+```
+
+### Central Postgres rows are not appearing
+
+```bash
+# Confirm rows are queued locally
+sqlite3 ~/.token_sidecar/tokens.db \
+  "SELECT COUNT(*), MAX(last_sync_error) FROM token_usage;"
+
+# Confirm the sidecar process has the DSN env var
+grep TOKEN_SIDECAR_POSTGRES_DSN ~/Library/LaunchAgents/com.athena.token-sidecar.plist
+
+# Check central connectivity from this machine
+TOKEN_SIDECAR_QUERY_DSN="$TOKEN_SIDECAR_POSTGRES_DSN" \
+  uv run python -m queries.summary by-model --backend postgres --format table
 ```
 
 ### Port already in use
@@ -266,10 +317,13 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 | File | Purpose |
 |------|---------|
 | `sidecar.py` | Main proxy — aiohttp app, intercepts responses, logs to SQLite |
-| `db.py` | SQLite schema + CRUD helpers (`init_db`, `log_token_usage`, `get_daily_summary`, `get_hourly_summary`) |
+| `db.py` | SQLite schema, local outbox/cache helpers, and SQLite summaries |
+| `central_sync.py` | Background flush helper: upload queued SQLite rows to Postgres and delete acknowledged rows |
+| `postgres_store.py` | Postgres schema, batch insert, and central summary queries |
 | `config_loader.py` | YAML config loader with typed `Config` dataclass and `--config` CLI override |
 | `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (manual alternative) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
+| `scripts/init_postgres.py` | Create central Postgres table, indexes, and reporting views |
 | `install.sh` | One-step install: dependencies, DB init, plist generation, optional launchd load |
 | `uninstall.sh` | Clean removal: unload LaunchAgent, optionally purge data and uv env |
 | `config.yaml` | Configuration file — all runtime settings |
@@ -279,14 +333,11 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 ## Development
 
 ```bash
-# Run the full test suite (56 tests)
+# Run the full test suite
 uv run python -m pytest tests/ -v
 
 # Run a specific test file
 uv run python -m pytest tests/test_db.py -v
-
-# Manual load test (not committed to git — for local profiling only)
-python scripts/stress_test.py --requests 20
 ```
 
 ---

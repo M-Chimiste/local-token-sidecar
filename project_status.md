@@ -157,6 +157,25 @@
 
 ---
 
+### ✅ Phase 8 — Central Postgres Reporting
+**Status:** Complete
+**Completed:** 2026-05-18
+
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Add `psycopg[binary]` dependency for optional central Postgres writes and queries | ✅ |
+| 2 | Extend SQLite `token_usage` into a local outbox/cache with `event_id`, `node_id`, endpoint/status, and retry metadata; migrate old DBs in place | ✅ |
+| 3 | Add `postgres_store.py` central schema, idempotent batch insert, reporting views, and Postgres summary queries | ✅ |
+| 4 | Add `central_sync.py` and sidecar background flusher with bounded retry backoff; Postgres is never called in the request path | ✅ |
+| 5 | Extend config with `node.id` and `database.central.*`; DSNs resolve from environment variables | ✅ |
+| 6 | Update query CLI with `--backend auto|sqlite|postgres` and `--node` filtering | ✅ |
+| 7 | Add Mac mini Postgres setup docs and schema initialization script | ✅ |
+| 8 | Verification: **81 passed + 2 skipped** across full test suite | ✅ |
+
+**Design note:** When central sync is enabled, local SQLite is a durable outbox/cache. Rows are deleted locally only after Postgres acknowledges the upload batch.
+
+---
+
 ## Discovery Notes
 
 ### LM Studio Port
@@ -180,6 +199,15 @@ proxy:
 
 database:
   path: "~/.token_sidecar/tokens.db"
+  central:
+    enabled: false
+    driver: "postgres"
+    dsn_env: "TOKEN_SIDECAR_POSTGRES_DSN"
+    flush_interval_seconds: 5
+    batch_size: 100
+
+node:
+  id: "local"
 
 logging:
   level: "INFO"   # DEBUG, INFO, WARNING, ERROR
@@ -193,41 +221,45 @@ launchd:
 
 ## All Phases Complete
 
-All 7 phases implemented, tested, and documented. The token-sidecar is production-ready.
+All 8 phases implemented, tested, and documented. The token-sidecar is production-ready for local SQLite usage and optional central Postgres reporting.
 
 **Git history:** 15 commits (`4c6099a` → `7fc6ca3`)
-**Test suite:** 63 passed + 1 skipped (INT-08 launchd respawn — manual verification only)
+**Test suite:** 81 passed + 2 skipped (INT-08 launchd respawn and optional live Postgres test)
 
 ---
 
-## File Inventory (after Phase 7)
+## File Inventory (after Phase 8)
 
 ```
 token_sidecar/
 ├── .git/                    # commits: 4c6099a → 7fc6ca3 (15 total)
 ├── .venv/                   # uv virtual environment
-├── README.md                ← NEW in Phase 7 — architecture, usage, troubleshooting
+├── README.md                ← architecture, central reporting setup, usage, troubleshooting
 ├── queries/
 │   ├── __init__.py          ← from Phase 5 (package marker)
-│   └── summary.py           ← from Phase 5 — click CLI, 3 subcommands
-│       daily [--date] [--model NAME] [--format json|table]
-│       hourly --date YYYY-MM-DD [--format json|table]
-│       by-model [--format json|table]
+│   └── summary.py           ← CLI: daily/hourly/by-model, SQLite or Postgres backend
 ├── tests/
-│   ├── test_db.py           ← from Phase 1 (11 passing)
-│   ├── test_proxy.py        ← from Phases 2 & 3 (6 passing)
-│   ├── test_launchd.py      ← from Phase 4 (17 passing)
-│   ├── test_queries.py      ← from Phase 5 (17 passing)
-│   └── test_integration.py  ← from Phase 6 (8 tests, 7 passed + 1 skipped)
-├── db.py                    ← from Phase 1
-├── sidecar.py               ← from Phases 2 & 3 & 6 (+health endpoint in Phase 6)
-├── config_loader.py         ← from Phase 3
-├── setup_launchd.py         ← from Phase 4
+│   ├── test_db.py           ← SQLite schema, migration, summaries, outbox
+│   ├── test_central_sync.py ← Postgres flush orchestration
+│   ├── test_proxy.py        ← proxy behavior and config validation
+│   ├── test_launchd.py      ← LaunchAgent plist/lifecycle behavior
+│   ├── test_queries.py      ← CLI behavior
+│   ├── test_integration.py  ← live sidecar/LM Studio integration
+│   └── test_postgres_integration.py ← optional live Postgres integration
+├── db.py                    ← SQLite outbox/cache and local summaries
+├── postgres_store.py        ← central Postgres schema, inserts, summaries
+├── central_sync.py          ← local outbox to Postgres batch sync
+├── sidecar.py               ← aiohttp proxy + background sync lifecycle
+├── config_loader.py         ← config, node id, central sync settings
+├── setup_launchd.py         ← LaunchAgent generation with env var support
+├── scripts/
+│   └── init_postgres.py     ← central schema initializer
 └── project_docs/
-    ├── plans/               # phase-0.md through phase-7.md — all complete
-    └── schema.md            ← NEW in Phase 7 — DB schema reference
+    ├── postgres_setup.md    ← Mac mini Postgres setup guide
+    ├── plans/               # phase-0.md through phase-7.md
+    └── schema.md            ← SQLite and Postgres schema reference
 ```
 
 ---
 
-*Last updated: 2026-05-17 (Phase 7 complete — all phases done)*
+*Last updated: 2026-05-18 (Phase 8 complete — central Postgres reporting)*

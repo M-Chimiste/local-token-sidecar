@@ -3,7 +3,8 @@ Configuration loader for token-sidecar.
 
 Loads config.yaml from:
   1. Path supplied via --config CLI argument (parse_cli_args())
-  2. The project root directory (same dir as this file), defaulting to config.yaml
+  2. TOKEN_SIDECAR_CONFIG environment variable
+  3. The project root directory (same dir as this file), defaulting to config.yaml
 
 On load, validates required keys and raises ValueError with a descriptive message
 if any are missing.
@@ -29,6 +30,18 @@ REQUIRED_KEYS: list[str] = [
 
 
 @dataclass(frozen=True)
+class CentralDatabaseConfig:
+    """Configuration for optional centralized Postgres reporting."""
+
+    enabled: bool = False
+    driver: str = "postgres"
+    dsn_env: str = "TOKEN_SIDECAR_POSTGRES_DSN"
+    dsn: str | None = None
+    flush_interval_seconds: float = 5.0
+    batch_size: int = 100
+
+
+@dataclass(frozen=True)
 class Config:
     """
     Immutable configuration object for the token-sidecar.
@@ -40,6 +53,8 @@ class Config:
                        (e.g. "http://localhost:1234").
         database_path: Expanded filesystem path to the SQLite DB file.
         log_level:     Logging level string (DEBUG, INFO, WARNING, ERROR).
+        node_id:       Stable reporting identity for this sidecar machine.
+        central:       Optional central Postgres sync configuration.
         _raw:          Original dict for forward compatibility.
     """
 
@@ -48,6 +63,8 @@ class Config:
     upstream_url: str
     database_path: pathlib.Path
     log_level: str
+    node_id: str
+    central: CentralDatabaseConfig
     _raw: dict = field(default_factory=dict)
 
     @classmethod
@@ -61,7 +78,9 @@ class Config:
         # Resolve dotted keys from nested dict structure
         proxy = _get(d, "proxy") or {}
         database = _get(d, "database") or {}
+        node = _get(d, "node") or {}
         logging_cfg = _get(d, "logging") or {}
+        central_cfg = database.get("central") or {}
 
         # Check for missing required keys (not log_level which is optional)
         # Use explicit 'key not in dict' checks so that falsy values like 0 are accepted.
@@ -83,6 +102,38 @@ class Config:
 
         db_path_raw = database.get("path", "~/.token_sidecar/tokens.db")
         db_path = pathlib.Path(db_path_raw).expanduser()
+        central_enabled = _as_bool(central_cfg.get("enabled", False))
+        node_id = str(node.get("id") or "").strip()
+        if central_enabled and not node_id:
+            raise ValueError(
+                "Missing required config key: node.id. "
+                "Set a stable node id when database.central.enabled is true."
+            )
+        if not node_id:
+            node_id = "local"
+
+        central_driver = str(central_cfg.get("driver", "postgres")).lower()
+        if central_enabled and central_driver != "postgres":
+            raise ValueError(
+                "Unsupported database.central.driver: "
+                f"{central_driver!r}. Only 'postgres' is supported."
+            )
+
+        dsn_env = str(
+            central_cfg.get("dsn_env", "TOKEN_SIDECAR_POSTGRES_DSN")
+        )
+        central_dsn = os.environ.get(dsn_env)
+        if central_enabled and not central_dsn:
+            raise ValueError(
+                f"Central Postgres sync is enabled, but {dsn_env} is not set."
+            )
+
+        flush_interval = float(central_cfg.get("flush_interval_seconds", 5))
+        batch_size = int(central_cfg.get("batch_size", 100))
+        if central_enabled and flush_interval <= 0:
+            raise ValueError("database.central.flush_interval_seconds must be > 0.")
+        if central_enabled and batch_size <= 0:
+            raise ValueError("database.central.batch_size must be > 0.")
 
         return cls(
             listen_host=str(proxy["listen_host"]),
@@ -90,6 +141,15 @@ class Config:
             upstream_url=str(proxy["upstream_url"]),
             database_path=db_path,
             log_level=logging_cfg.get("level", "INFO").upper(),
+            node_id=node_id,
+            central=CentralDatabaseConfig(
+                enabled=central_enabled,
+                driver=central_driver,
+                dsn_env=dsn_env,
+                dsn=central_dsn,
+                flush_interval_seconds=flush_interval,
+                batch_size=batch_size,
+            ),
             _raw=dict(d),
         )
 
@@ -104,6 +164,14 @@ def _get(d: dict, key: str):
         else:
             return None
     return val
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def load_config(config_path: pathlib.Path | str | None = None) -> Config:

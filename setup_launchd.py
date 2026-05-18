@@ -50,6 +50,7 @@ def generate_plist_content(
     sidecar_script: pathlib.Path,
     log_out_path: pathlib.Path,
     log_err_path: pathlib.Path,
+    environment_variables: dict[str, str] | None = None,
 ) -> str:
     """
     Build and return the LaunchAgent plist XML as a string.
@@ -78,6 +79,8 @@ def generate_plist_content(
         "StandardErrorPath": str(log_err_path),
         "WorkingDirectory": str(project_dir),
     }
+    if environment_variables:
+        plist_data["EnvironmentVariables"] = environment_variables
 
     with open(plist_data["StandardOutPath"], "a", encoding="utf-8") as fh:
         # Ensure log directory exists before launchd tries to write
@@ -116,6 +119,7 @@ def install(config_path: Optional[str] = None) -> None:
 
     # Load config to get database path (for log directory)
     from config_loader import load_config
+    effective_config_path = config_path or os.environ.get("TOKEN_SIDECAR_CONFIG")
     cfg = load_config(config_path)
 
     # Sidecar script and project root
@@ -125,6 +129,16 @@ def install(config_path: Optional[str] = None) -> None:
     log_dir = pathlib.Path(cfg.database_path).parent.resolve()
     log_out_path = log_dir / "sidecar.log"
     log_err_path = log_dir / "sidecar.error.log"
+    config_file = (
+        pathlib.Path(effective_config_path).expanduser().resolve()
+        if effective_config_path
+        else PROJECT_ROOT / "config.yaml"
+    )
+    environment_variables = {
+        "TOKEN_SIDECAR_CONFIG": str(config_file),
+    }
+    if cfg.central.enabled and cfg.central.dsn:
+        environment_variables[cfg.central.dsn_env] = cfg.central.dsn
 
     # Ensure the directory exists with restricted permissions
     log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -134,6 +148,7 @@ def install(config_path: Optional[str] = None) -> None:
         sidecar_script=sidecar_script,
         log_out_path=log_out_path,
         log_err_path=log_err_path,
+        environment_variables=environment_variables,
     )
 
     plist_path = _get_plist_path()
@@ -141,8 +156,8 @@ def install(config_path: Optional[str] = None) -> None:
     # Write plist
     with open(plist_path, "w", encoding="utf-8") as fh:
         fh.write(plist_content)
-    # Secure: user-only read/write on the plist itself (same perms as directory)
-    os.chmod(plist_path, 0o644)
+    # If central sync is enabled the plist may contain the DSN env var.
+    os.chmod(plist_path, 0o600 if cfg.central.enabled else 0o644)
 
     print(f"Plist written to:\n  {plist_path}\n")
     _print_load_instructions()
@@ -220,7 +235,7 @@ def _print_load_instructions() -> None:
           launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 
         To unload and stop it without removing the plist:
-          uv run python setup_launchd.py uninstall
+          uv run python setup_launchd.py unload
     """))
 
 

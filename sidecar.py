@@ -5,7 +5,8 @@ A lightweight aiohttp-based proxy that:
   - Accepts LLM API calls on localhost:1240
   - Forwards them verbatim to LM Studio at localhost:1234
   - Intercepts the response, extracts token usage (usage object)
-  - Writes a row to SQLite via db.log_token_usage()
+  - Queues a local SQLite outbox row via db.log_token_usage()
+  - Optionally flushes queued rows to central Postgres in the background
   - Returns the original upstream response unchanged
 
 Usage:
@@ -14,13 +15,17 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
+from typing import Any
 
 import aiohttp
 from aiohttp import web
 
+import central_sync
 import db as _db
 from config_loader import load_config, parse_cli_args, Config
 
@@ -54,6 +59,7 @@ async def forward_and_intercept(
     request: web.Request,
     upstream_url: str,
     db_path: str,
+    node_id: str,
 ) -> web.Response:
     """
     Forward an LLM API request to the upstream LM Studio instance,
@@ -114,20 +120,29 @@ async def forward_and_intercept(
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                        _db.log_token_usage(
-                            db_path=db_path,
-                            model=model_name,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=total_tokens,
-                            response_ms=elapsed_ms,
-                        )
-                        logger.info(
-                            "tokens logged  model=%-30s  prompt=%5d  "
-                            "completion=%5d  total=%6d  (%.1fms)",
-                            model_name, prompt_tokens, completion_tokens,
-                            total_tokens, elapsed_ms,
-                        )
+                        try:
+                            _db.log_token_usage(
+                                db_path=db_path,
+                                node_id=node_id,
+                                endpoint=request.path,
+                                status_code=upstream_resp.status,
+                                model=model_name,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                response_ms=elapsed_ms,
+                            )
+                            logger.info(
+                                "tokens queued  node=%s  model=%-30s  prompt=%5d  "
+                                "completion=%5d  total=%6d  (%.1fms)",
+                                node_id, model_name, prompt_tokens,
+                                completion_tokens, total_tokens, elapsed_ms,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to queue token usage locally; returning "
+                                "upstream response unchanged"
+                            )
 
                 except json.JSONDecodeError:
                     # Non-JSON response — can happen on some error paths; ignore usage.
@@ -142,7 +157,7 @@ async def forward_and_intercept(
                     content_type="application/json",
                 )
 
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         logger.error("Upstream error: %s", exc)
         return web.Response(
             body=json.dumps({
@@ -170,6 +185,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         request,
         str(cfg.upstream_url),
         str(cfg.database_path),
+        cfg.node_id,
     )
 
 
@@ -185,6 +201,7 @@ async def handle_completions(request: web.Request) -> web.Response:
         request,
         str(cfg.upstream_url),
         str(cfg.database_path),
+        cfg.node_id,
     )
 
 
@@ -192,14 +209,16 @@ async def handle_proxy(request: web.Request) -> web.Response:
     """
     Generic proxy for any path not explicitly registered.
     
-    Forwards the request verbatim to LM Studio without interception.
-    This handles endpoints like /v1/models, /v1/engines, etc.
+    Forwards the request verbatim to LM Studio. If the upstream response
+    contains an OpenAI-compatible usage object, it is queued like the primary
+    completion endpoints.
     """
     cfg: Config = request.app["config"]
     return await forward_and_intercept(
         request,
         str(cfg.upstream_url),
         str(cfg.database_path),
+        cfg.node_id,
     )
 
 
@@ -237,10 +256,11 @@ def create_app(cfg: Config) -> web.Application:
         POST /v1/completions       — forward to upstream, log usage
         GET  /health               — liveness probe (200 OK)
 
-    All other paths return JSON 404.
+    Other GET/POST paths are proxied to upstream without special handling.
     """
     app = web.Application()
     app["config"] = cfg
+    app.cleanup_ctx.append(central_sync_context)
 
     # Explicit routes for the two LLM endpoints we care about
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
@@ -256,6 +276,55 @@ def create_app(cfg: Config) -> web.Application:
     return app
 
 
+async def central_sync_context(app: web.Application):
+    """Run optional central Postgres flushing for the app lifetime."""
+    cfg: Config = app["config"]
+    if not cfg.central.enabled:
+        yield
+        return
+
+    task = asyncio.create_task(_central_sync_loop(cfg))
+    app["central_sync_task"] = task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _central_sync_loop(cfg: Config) -> None:
+    """Flush queued local rows to Postgres with bounded backoff."""
+    failures = 0
+    assert cfg.central.dsn is not None
+
+    while True:
+        delay = cfg.central.flush_interval_seconds
+        try:
+            flushed = await asyncio.to_thread(
+                central_sync.flush_once,
+                db_path=str(cfg.database_path),
+                postgres_dsn=cfg.central.dsn,
+                batch_size=cfg.central.batch_size,
+                node_id=cfg.node_id,
+            )
+            if flushed:
+                logger.info("flushed %d token usage row(s) to Postgres", flushed)
+            failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures += 1
+            delay = min(delay * (2 ** min(failures, 4)), 60.0)
+            logger.warning(
+                "central Postgres flush failed; queued rows will retry in %.1fs: %s",
+                delay,
+                exc,
+            )
+
+        await asyncio.sleep(delay)
+
+
 def main() -> None:
     cli_args = parse_cli_args()
     cfg = load_config(cli_args.config)
@@ -268,7 +337,7 @@ def main() -> None:
     )
 
     # Ensure the database schema exists before handling any traffic
-    _db.init_db(str(cfg.database_path))
+    _db.init_db(str(cfg.database_path), node_id=cfg.node_id)
 
     logger.info("Starting sidecar on %s:%d → %s", cfg.listen_host, cfg.listen_port, cfg.upstream_url)
     app = create_app(cfg)

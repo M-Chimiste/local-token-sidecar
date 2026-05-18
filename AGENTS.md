@@ -11,11 +11,12 @@ usage tracking on macOS.
 
 The sidecar listens on `localhost:1240`, forwards OpenAI-compatible requests to
 LM Studio at `http://localhost:1234`, extracts token usage from upstream
-responses, writes one row per request to SQLite, and returns the upstream
-response to the caller unchanged.
+responses, writes one local SQLite outbox row per request, and returns the
+upstream response to the caller unchanged.
 
-The service is intentionally local and small: no Docker, no external database,
-no cloud service, and no authentication layer in the current design.
+The service is intentionally small. SQLite remains the local hot-path cache, and
+optional central Postgres sync can upload queued rows for cross-machine
+reporting.
 
 ## Source Of Truth
 
@@ -37,7 +38,11 @@ commands, ports, schema, or launchd behavior.
 - `sidecar.py` builds the aiohttp app, forwards `/v1/chat/completions` and
   `/v1/completions`, handles `/health`, logs token usage, and returns JSON 404s.
 - `db.py` owns SQLite schema creation, inserts, and daily/hourly summary
-  queries.
+  queries, plus the local outbox/cache used by central sync.
+- `postgres_store.py` owns central Postgres schema, batch inserts, and central
+  summary queries.
+- `central_sync.py` uploads queued SQLite outbox rows to Postgres and deletes
+  local rows only after acknowledgement.
 - `config_loader.py` loads `config.yaml`, validates required keys, and exposes
   the immutable `Config` dataclass.
 - `setup_launchd.py` installs, unloads, removes, and checks the macOS
@@ -56,10 +61,13 @@ commands, ports, schema, or launchd behavior.
 - Only log usage when the upstream response is JSON and contains a dict-shaped
   `usage` object.
 - Store timestamps in UTC ISO 8601 format.
-- Keep SQLite as the local persistence layer unless the user explicitly asks for
-  a broader redesign.
+- Keep SQLite as the hot-path persistence layer. Do not put Postgres calls in
+  the request path.
+- When central sync is enabled, delete local rows only after Postgres
+  acknowledges the batch.
 - Keep `config.yaml` as the main configuration surface; support `--config` where
   existing CLIs already do.
+- Keep Postgres DSNs in environment variables, not committed config.
 - Keep launchd support macOS user-scoped. Do not make LaunchAgent commands run
   as root.
 - Treat `localhost:1240` as the sidecar default and `http://localhost:1234` as
@@ -108,6 +116,7 @@ Query collected usage:
 uv run python -m queries.summary daily
 uv run python -m queries.summary hourly --date YYYY-MM-DD
 uv run python -m queries.summary by-model
+uv run python -m queries.summary daily --backend postgres --node athena
 ```
 
 Manage the LaunchAgent:
@@ -148,8 +157,8 @@ correctly and callers still receive the expected upstream status/body.
 - Keep database schema changes explicit and covered by tests. If a schema change
   is needed, update `project_docs/schema.md` and affected query CLI behavior.
 - Avoid broad dependency additions. The current runtime stack is `aiohttp`,
-  `click`, `httpx`, `pytest`, `pytest-aiohttp`, `pytest-asyncio`, `pyyaml`, and
-  `tabulate`.
+  `click`, `httpx`, `psycopg`, `pytest`, `pytest-aiohttp`, `pytest-asyncio`,
+  `pyyaml`, and `tabulate`.
 - Keep user-facing errors clear and local-actionable, especially for missing
   config, LM Studio downtime, and launchd state.
 
