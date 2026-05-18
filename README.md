@@ -1,6 +1,6 @@
 # Token Counter Sidecar
 
-**Python:** 3.11+ · **Tests:** 64 passing (63 + 1 skipped) · **macOS only**
+**Python:** 3.11+ · **Tests:** 56 passing · **macOS only**
 
 A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM API response, and writes token usage to a local SQLite database — no Docker, no containers, just Python.
 
@@ -48,19 +48,27 @@ A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM A
 # 1. Clone / cd into the project
 cd ~/Documents/hermes_projects/token_sidecar
 
-# 2. Sync dependencies (creates .venv, installs packages)
-uv sync
+# 2. Run the install script — handles all setup in one step:
+./install.sh          # interactive (confirms before loading launchd)
+./install.sh --force  # fully silent, load immediately
 
-# 3. Configure — defaults work out of the box; edit if you changed ports
-#    sidecar listen:   localhost:1240
-#    upstream target:  http://localhost:1234
-#    database:         ~/.token_sidecar/tokens.db
-vim config.yaml
+# That's it! The sidecar is installed and running.
+```
 
-# 4a. Run manually (dev)
+The install script will:
+- Verify `uv` and Python ≥3.11 are present
+- Run `uv sync` to install dependencies
+- Create `~/.token_sidecar/` (mode `0700`) and initialise the SQLite schema
+- Generate + validate the LaunchAgent plist from `config.yaml`
+- Optionally load it via launchd (starts on every login)
+
+### Manual alternatives
+
+```bash
+# Run manually without installing as a LaunchAgent:
 uv run python sidecar.py
 
-# 4b. Install as a LaunchAgent (starts immediately and on every login)
+# Install just the LaunchAgent step manually:
 uv run python setup_launchd.py install
 launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 ```
@@ -120,12 +128,65 @@ Date       Model             Requests   Prompt Tokens   Completion Tokens   Tota
 2026-05-17  qwen3.6-27b-mlx          4             832                 201         1,033
 ```
 
----
+### Querying the database directly
 
-## LaunchAgent management
+The SQLite file lives at `~/.token_sidecar/tokens.db`. You can query it with the `sqlite3` CLI:
 
 ```bash
-# Install — generates plist and prints load instructions
+# Recent rows (last 10)
+sqlite3 ~/.token_sidecar/tokens.db \
+  "SELECT datetime(timestamp), model_name, prompt_tokens, completion_tokens, total_tokens
+   FROM token_usage ORDER BY id DESC LIMIT 10;"
+
+# All-time totals by model
+sqlite3 ~/.token_sidecar/tokens.db \
+  "SELECT model_name, COUNT(*) AS requests,
+          SUM(prompt_tokens) AS prompt_toks,
+          SUM(completion_tokens) AS completion_toks,
+          SUM(total_tokens) AS total_toks
+   FROM token_usage GROUP BY model_name ORDER BY total_toks DESC;"
+
+# Today's usage
+sqlite3 ~/.token_sidecar/tokens.db \
+  "SELECT date(timestamp) AS day, SUM(total_tokens)
+   FROM token_usage WHERE date(timestamp)=date('now') GROUP BY day;"
+```
+
+Or override the path via environment variable for scripting:
+
+```bash
+TOKEN_SIDECAR_DB=/path/to/tokens.db uv run python -m queries.summary daily
+```
+
+---
+
+## Install & Uninstall
+
+### `./install.sh` — full setup
+
+```bash
+./install.sh          # interactive, confirms before loading launchd
+./install.sh --force  # silent, load immediately
+```
+
+Does everything: dependencies, DB init, plist generation, optional launchd load.
+
+### `./uninstall.sh` — clean removal
+
+```bash
+./uninstall.sh           # remove launchd only, keep ~/.token_sidecar/
+./uninstall.sh --purge   # also delete all data and uv environment
+./uninstall.sh --force   # skip confirmations
+```
+
+---
+
+## LaunchAgent management (manual)
+
+If you prefer to manage the plist manually without the shell scripts:
+
+```bash
+# Install — generates plist and loads it
 uv run python setup_launchd.py install
 
 # Check status (loaded / unloaded + plist path)
@@ -163,9 +224,8 @@ grep upstream_url config.yaml
 ### No data appearing in SQLite
 
 ```bash
-# Is the sidecar actually listening?
-curl -s http://localhost:1240/health
-# Expected: {"status": "ok"}
+# Is the sidecar running and responding?
+curl -s http://localhost:1240/v1/models | head -c 200
 
 # Check the log file for errors
 tail ~/.token_sidecar/sidecar.error.log
@@ -208,8 +268,10 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 | `sidecar.py` | Main proxy — aiohttp app, intercepts responses, logs to SQLite |
 | `db.py` | SQLite schema + CRUD helpers (`init_db`, `log_token_usage`, `get_daily_summary`, `get_hourly_summary`) |
 | `config_loader.py` | YAML config loader with typed `Config` dataclass and `--config` CLI override |
-| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status |
+| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (manual alternative) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
+| `install.sh` | One-step install: dependencies, DB init, plist generation, optional launchd load |
+| `uninstall.sh` | Clean removal: unload LaunchAgent, optionally purge data and uv env |
 | `config.yaml` | Configuration file — all runtime settings |
 
 ---
@@ -217,7 +279,7 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 ## Development
 
 ```bash
-# Run the full test suite (64 tests)
+# Run the full test suite (56 tests)
 uv run python -m pytest tests/ -v
 
 # Run a specific test file
@@ -229,4 +291,4 @@ python scripts/stress_test.py --requests 20
 
 ---
 
-*Last updated: 2026-05-17*
+*Last updated: 2026-05-18*

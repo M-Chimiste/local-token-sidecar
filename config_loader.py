@@ -13,6 +13,7 @@ Paths containing ~ are expanded using pathlib.Path.expanduser().
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 from dataclasses import dataclass, field
 
@@ -109,9 +110,14 @@ def load_config(config_path: pathlib.Path | str | None = None) -> Config:
     """
     Load and validate config.yaml.
 
+    Resolution order:
+      1. ``config_path`` argument (from --config CLI or explicit call)
+      2. ``TOKEN_SIDECAR_CONFIG`` environment variable
+      3. ``config.yaml`` in the same directory as this module
+
     Args:
-        config_path: Path to config file. If None, defaults to config.yaml in the
-                     same directory as this module.
+        config_path: Path to config file. If None, falls back to env var then
+                     project-local config.yaml.
 
     Returns:
         A validated Config instance.
@@ -121,15 +127,23 @@ def load_config(config_path: pathlib.Path | str | None = None) -> Config:
         ValueError:         One or more required keys are missing from the YAML.
     """
     if config_path is None:
-        base = pathlib.Path(__file__).parent
-        config_path = base / "config.yaml"
+        # Check environment variable next
+        env = os.environ.get("TOKEN_SIDECAR_CONFIG")
+        if env:
+            config_path = env
+        else:
+            base = pathlib.Path(__file__).parent
+            config_path = base / "config.yaml"
     else:
         config_path = pathlib.Path(config_path)
+
+    # Normalize to Path (env var may be a plain string)
+    config_path = pathlib.Path(config_path)
 
     if not config_path.exists():
         raise FileNotFoundError(
             f"Config file not found: {config_path}. "
-            f"Use --config <path> to specify a custom location."
+            f"Use --config <path> or TOKEN_SIDECAR_CONFIG=<path> to specify a location."
         )
 
     with open(config_path) as f:

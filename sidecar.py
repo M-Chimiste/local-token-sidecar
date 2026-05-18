@@ -188,8 +188,23 @@ async def handle_completions(request: web.Request) -> web.Response:
     )
 
 
+async def handle_proxy(request: web.Request) -> web.Response:
+    """
+    Generic proxy for any path not explicitly registered.
+    
+    Forwards the request verbatim to LM Studio without interception.
+    This handles endpoints like /v1/models, /v1/engines, etc.
+    """
+    cfg: Config = request.app["config"]
+    return await forward_and_intercept(
+        request,
+        str(cfg.upstream_url),
+        str(cfg.database_path),
+    )
+
+
 async def handle_404(request: web.Request) -> web.Response:
-    """Catch-all 404 for any path not explicitly registered."""
+    """Fallback 404 — should rarely be reached now."""
     return web.Response(
         body=json.dumps({
             "error": "Not found",
@@ -234,8 +249,9 @@ def create_app(cfg: Config) -> web.Application:
     # Health check (GET) — used by integration tests and launchd respawn checks
     app.router.add_get("/health", handle_health)
 
-    # Catch-all: return JSON 404 for anything else
-    app.router.add_route("*", "/{tail:.*}", handle_404)
+    # Catch-all: proxy any unmatched path to upstream LM Studio
+    app.router.add_route("GET",  "/{tail:.*}", handle_proxy)
+    app.router.add_route("POST", "/{tail:.*}", handle_proxy)
 
     return app
 
