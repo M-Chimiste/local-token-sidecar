@@ -36,6 +36,7 @@ import db as _db_module
 # Some models (qwen3.6-27b-mlx, gemma variants) can take 60–90s on cold load.
 # Use a generous per-request read timeout to avoid intermittent failures.
 DEFAULT_REQUEST_TIMEOUT = httpx.Timeout(30.0, read=120.0)
+_VALIDATED_TEST_MODELS: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +85,62 @@ def read_db_rows(db_path: str) -> list[dict]:
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
     return rows
+
+
+def get_test_models(min_count: int = 1) -> list[str]:
+    """Return available LM Studio model ids for live integration tests."""
+    global _VALIDATED_TEST_MODELS
+    if _VALIDATED_TEST_MODELS and len(_VALIDATED_TEST_MODELS) >= min_count:
+        return _VALIDATED_TEST_MODELS[:min_count]
+
+    explicit = os.environ.get("TOKEN_SIDECAR_TEST_MODELS")
+    if explicit:
+        models = [m.strip() for m in explicit.split(",") if m.strip()]
+        candidates = models
+    else:
+        upstream_url = os.environ.get("TOKEN_SIDECAR_UPSTREAM_URL", "http://localhost:1234")
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"{upstream_url}/v1/models")
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            pytest.skip(f"LM Studio models endpoint unavailable: {exc}")
+
+        candidates = [
+            item.get("id")
+            for item in data.get("data", [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and "embed" not in str(item.get("id")).lower()
+        ]
+
+    upstream_url = os.environ.get("TOKEN_SIDECAR_UPSTREAM_URL", "http://localhost:1234")
+    validated: list[str] = []
+    with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+        for model in candidates:
+            try:
+                resp = client.post(
+                    f"{upstream_url}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Reply ok."}],
+                        "max_tokens": 1,
+                    },
+                )
+            except Exception:
+                continue
+            if resp.status_code == 200:
+                validated.append(str(model))
+            if len(validated) >= min_count:
+                break
+
+    _VALIDATED_TEST_MODELS = validated
+    if len(validated) < min_count:
+        pytest.skip(
+            f"Need at least {min_count} chat-capable LM Studio model(s), got {validated}"
+        )
+    return validated[:min_count]
 
 
 # ---------------------------------------------------------------------------
@@ -153,12 +210,13 @@ logging:
 def test_integration_single_chat_request(sidecar_env) -> None:
     """Send one POST /v1/chat/completions; verify response + SQLite row."""
     port, db_path = sidecar_env
+    model = get_test_models(1)[0]
 
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
         resp = client.post(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             json={
-                "model": "minimax-m2.7",
+                "model": model,
                 "messages": [{"role": "user", "content": "Say hello in one word."}],
                 "max_tokens": 10,
             },
@@ -172,7 +230,7 @@ def test_integration_single_chat_request(sidecar_env) -> None:
     rows = read_db_rows(db_path)
     assert len(rows) >= 1, "No rows written to DB after request"
     row = rows[-1]
-    assert row["model"] == "minimax-m2.7"
+    assert row["model"] == model
     assert int(row["prompt_tokens"]) > 0, f"prompt_tokens should be > 0: {row}"
     assert int(row["total_tokens"]) >= int(row["prompt_tokens"])
     # Verify response_ms
@@ -187,9 +245,10 @@ def test_integration_single_chat_request(sidecar_env) -> None:
 def test_integration_multiple_requests_aggregation(sidecar_env) -> None:
     """Send 3 requests to different models; verify each creates a separate row."""
     port, db_path = sidecar_env
+    models = get_test_models(3)
 
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
-        for model in ["minimax-m2.7", "nvidia/nemotron-3-nano-omni", "qwen3.6-27b-mlx"]:
+        for model in models:
             resp = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 json={
@@ -202,7 +261,7 @@ def test_integration_multiple_requests_aggregation(sidecar_env) -> None:
 
     rows = read_db_rows(db_path)
     models_seen = {r["model"] for r in rows}
-    assert len(models_seen) >= 3, f"Expected ≥3 unique models, got: {models_seen}"
+    assert set(models).issubset(models_seen), f"Expected {models}, got: {models_seen}"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +273,7 @@ def test_integration_daily_query_matches_db(sidecar_env) -> None:
     import subprocess as _subprocess
 
     port, db_path = sidecar_env
+    model = get_test_models(1)[0]
 
     # Send 2 requests
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
@@ -221,7 +281,7 @@ def test_integration_daily_query_matches_db(sidecar_env) -> None:
             resp = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 json={
-                    "model": "minimax-m2.7",
+                    "model": model,
                     "messages": [{"role": "user", "content": f"What's {i}+{i}?"}],
                     "max_tokens": 15,
                 },
@@ -242,12 +302,12 @@ def test_integration_daily_query_matches_db(sidecar_env) -> None:
     assert result.returncode == 0, f"CLI failed: {result.stderr}"
 
     data = json.loads(result.stdout)
-    minimax_rows = [r for r in data if r["model"] == "minimax-m2.7"]
+    model_rows = [r for r in data if r["model"] == model]
     # Direct DB count of today's rows
-    direct_count = sum(1 for r in read_db_rows(db_path) if r["model"] == "minimax-m2.7")
-    assert len(minimax_rows) >= 1, f"No minimax rows in daily output: {data}"
-    assert minimax_rows[0]["request_count"] == direct_count, (
-        f"CLI request_count ({minimax_rows[0]['request_count']}) != "
+    direct_count = sum(1 for r in read_db_rows(db_path) if r["model"] == model)
+    assert len(model_rows) >= 1, f"No {model} rows in daily output: {data}"
+    assert model_rows[0]["request_count"] == direct_count, (
+        f"CLI request_count ({model_rows[0]['request_count']}) != "
         f"direct DB count ({direct_count})"
     )
 
@@ -262,12 +322,13 @@ def test_integration_hourly_query_returns_data(sidecar_env) -> None:
     from datetime import datetime, timezone
 
     port, db_path = sidecar_env
+    model = get_test_models(1)[0]
 
     with httpx.Client(timeout=60.0) as client:
         resp = client.post(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             json={
-                "model": "minimax-m2.7",
+                "model": model,
                 "messages": [{"role": "user", "content": "Reply ok."}],
                 "max_tokens": 5,
             },
@@ -304,9 +365,10 @@ def test_integration_by_model_sorted_descending(sidecar_env) -> None:
     import subprocess as _subprocess
 
     port, db_path = sidecar_env
+    models = get_test_models(2)
 
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
-        for model in ["minimax-m2.7", "nvidia/nemotron-3-nano-omni"]:
+        for model in models:
             resp = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 json={
@@ -352,6 +414,7 @@ def test_integration_lm_studio_offline_502(tmp_path: pathlib.Path) -> None:
     port = get_free_port()
     db_path = tmp_path / "tokens.db"
     config_path = tmp_path / "config.yaml"
+    model = get_test_models(1)[0]
 
     # Point to a port with nothing listening — simulates LM Studio offline
     bad_upstream = "http://127.0.0.1:65535"
@@ -387,7 +450,7 @@ logging:
             resp = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
                 json={
-                    "model": "minimax-m2.7",
+                    "model": model,
                     "messages": [{"role": "user", "content": "Hi"}],
                     "max_tokens": 5,
                 },
@@ -415,6 +478,7 @@ def test_integration_lm_studio_recovery_after_offline(tmp_path: pathlib.Path) ->
     port = get_free_port()
     db_path = tmp_path / "tokens.db"
     config_path = tmp_path / "config.yaml"
+    model = get_test_models(1)[0]
 
     # Start pointing to a dead port
     bad_upstream = "http://127.0.0.1:65535"
@@ -448,7 +512,7 @@ logging:
         with httpx.Client(timeout=10.0) as client:
             resp1 = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
-                json={"model": "minimax-m2.7", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5},
+                json={"model": model, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5},
             )
         assert resp1.status_code >= 400
 
@@ -485,7 +549,7 @@ logging:
         with httpx.Client(timeout=30.0) as client:
             resp2 = client.post(
                 f"http://127.0.0.1:{port}/v1/chat/completions",
-                json={"model": "minimax-m2.7", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5},
+                json={"model": model, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5},
             )
         assert resp2.status_code == 200, (
             f"Recovery request failed: {resp2.status_code} — {resp2.text}"
@@ -572,10 +636,11 @@ def test_integration_launchd_respawn(sidecar_env) -> None:
         pytest.fail(f"Sidecar restarted (PID {new_pid}) but /health not responding: {exc}")
 
     # Verify DB writes still work
+    model = get_test_models(1)[0]
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(
             "http://127.0.0.1:1240/v1/chat/completions",
-            json={"model": "minimax-m2.7", "messages": [{"role": "user", "content": "Still alive?"}], "max_tokens": 5},
+            json={"model": model, "messages": [{"role": "user", "content": "Still alive?"}], "max_tokens": 5},
         )
     assert resp.status_code == 200, f"Post-respawn request failed: {resp.status_code}"
 

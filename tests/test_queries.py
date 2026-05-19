@@ -28,7 +28,7 @@ import pytest
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from queries.summary import resolve_format
+from queries.summary import resolve_backend, resolve_format, should_fallback_to_sqlite
 
 
 # -----------------------------------------------------------------------
@@ -50,29 +50,29 @@ def sample_db(tmp_path: pathlib.Path) -> pathlib.Path:
     # ── Day 1: two models, multiple requests ────────────────────────────
     day1 = "2026-05-16"
     rows_d1 = [
-        # model, prompt_tok, completion_tok, total_tok, response_ms
-        ("minimax-m2.7",      1000, 200, 1200, 3500),
-        ("minimax-m2.7",       800, 150,  950, 2100),
-        ("qwen3.6-27b-mlx",   3000, 500, 3500, 8200),
+        # model, prompt_tok, completion_tok, total_tok, response_ms, node_id
+        ("minimax-m2.7",      1000, 200, 1200, 3500, "athena"),
+        ("minimax-m2.7",       800, 150,  950, 2100, "metis"),
+        ("qwen3.6-27b-mlx",   3000, 500, 3500, 8200, "athena"),
     ]
-    for model, pt, ct, tt, ms in rows_d1:
+    for model, pt, ct, tt, ms, node_id in rows_d1:
         cur.execute(
-            "INSERT INTO token_usage (timestamp,model,prompt_tokens,"
-            "completion_tokens,total_tokens,response_ms) VALUES (?,?,?,?,?,?)",
-            (f"{day1}T10:00:00+00:00", model, pt, ct, tt, ms),
+            "INSERT INTO token_usage (timestamp,node_id,model,prompt_tokens,"
+            "completion_tokens,total_tokens,response_ms) VALUES (?,?,?,?,?,?,?)",
+            (f"{day1}T10:00:00+00:00", node_id, model, pt, ct, tt, ms),
         )
 
     # ── Day 2: one shared request + a new model on day 2 ────────────────
     day2 = "2026-05-17"
     rows_d2 = [
-        ("minimax-m2.7",       39,   5,   44, 3522),   # from Phase 2 E2E
-        ("gemma-4-it-4b",     2000, 300, 2300, 4100),
+        ("minimax-m2.7",       39,   5,   44, 3522, "athena"),   # from Phase 2 E2E
+        ("gemma-4-it-4b",     2000, 300, 2300, 4100, "athena"),
     ]
-    for model, pt, ct, tt, ms in rows_d2:
+    for model, pt, ct, tt, ms, node_id in rows_d2:
         cur.execute(
-            "INSERT INTO token_usage (timestamp,model,prompt_tokens,"
-            "completion_tokens,total_tokens,response_ms) VALUES (?,?,?,?,?,?)",
-            (f"{day2}T14:00:00+00:00", model, pt, ct, tt, ms),
+            "INSERT INTO token_usage (timestamp,node_id,model,prompt_tokens,"
+            "completion_tokens,total_tokens,response_ms) VALUES (?,?,?,?,?,?,?)",
+            (f"{day2}T14:00:00+00:00", node_id, model, pt, ct, tt, ms),
         )
 
     conn.commit()
@@ -85,6 +85,8 @@ def _env(db_path: pathlib.Path) -> dict[str, str]:
     """Return a clean env dict with TOKEN_SIDECAR_DB set."""
     env = {**os.environ, "TOKEN_SIDECAR_DB": str(db_path)}
     # Remove any config-override signals to ensure we use our fixture
+    env.pop("TOKEN_SIDECAR_QUERY_DSN", None)
+    env.pop("TOKEN_SIDECAR_POSTGRES_DSN", None)
     return env
 
 
@@ -108,6 +110,26 @@ def test_resolve_format_defaults_to_table_in_tty(monkeypatch: pytest.MonkeyPatch
 def test_resolve_format_defaults_to_json_when_not_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
     assert resolve_format(None) == "json"
+
+
+def test_resolve_backend_auto_uses_sqlite_without_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TOKEN_SIDECAR_QUERY_DSN", raising=False)
+    monkeypatch.delenv("TOKEN_SIDECAR_POSTGRES_DSN", raising=False)
+    assert resolve_backend("auto") == ("sqlite", None)
+
+
+def test_resolve_backend_auto_uses_postgres_with_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOKEN_SIDECAR_QUERY_DSN", "postgresql://query")
+    assert resolve_backend("auto") == ("postgres", "postgresql://query")
+
+
+def test_auto_backend_postgres_error_can_fallback(capsys: pytest.CaptureFixture) -> None:
+    assert should_fallback_to_sqlite("auto", RuntimeError("no select")) is True
+    assert "falling back to SQLite" in capsys.readouterr().err
+
+
+def test_explicit_postgres_error_does_not_fallback() -> None:
+    assert should_fallback_to_sqlite("postgres", RuntimeError("no select")) is False
 
 
 # -----------------------------------------------------------------------
@@ -164,6 +186,21 @@ def test_daily_model_filter(
     assert data[0]["model"] == "qwen3.6-27b-mlx"
 
 
+def test_daily_node_filter(sample_db: pathlib.Path) -> None:
+    """--node filters local SQLite results before aggregation."""
+    result = subprocess_run(
+        ["-m", "queries.summary", "daily",
+         "--date", "2026-05-16", "--node", "athena"],
+        env=_env(sample_db),
+    )
+    assert result.returncode == 0
+    data = json.loads(result.stdout)
+    by_model = {r["model"]: r for r in data}
+    assert by_model["minimax-m2.7"]["request_count"] == 1
+    assert by_model["minimax-m2.7"]["total_prompt_tokens"] == 1000
+    assert "qwen3.6-27b-mlx" in by_model
+
+
 def test_daily_no_data_for_date(
     sample_db: pathlib.Path,
 ) -> None:
@@ -205,6 +242,17 @@ def test_daily_invalid_date_format(
     )
     assert result.returncode != 0
     assert "Invalid date" in result.stderr or "Error" in result.stderr
+
+
+def test_postgres_backend_requires_dsn(sample_db: pathlib.Path) -> None:
+    """Explicit --backend postgres needs a Postgres DSN env var."""
+    result = subprocess_run(
+        ["-m", "queries.summary", "daily",
+         "--date", "2026-05-16", "--backend", "postgres"],
+        env=_env(sample_db),
+    )
+    assert result.returncode != 0
+    assert "TOKEN_SIDECAR_QUERY_DSN" in result.stderr
 
 
 # -----------------------------------------------------------------------

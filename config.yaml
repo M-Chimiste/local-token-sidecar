@@ -3,8 +3,17 @@ proxy:
   listen_port: 1240          # sidecar binds here; forwards to LM Studio upstream_url
   upstream_url: "http://localhost:1234"
 
+node:
+  id: "local"                # set per machine when central sync is enabled (e.g. athena)
+
 database:
   path: "~/.token_sidecar/tokens.db"
+  central:
+    enabled: false
+    driver: "postgres"
+    dsn_env: "TOKEN_SIDECAR_POSTGRES_DSN"
+    flush_interval_seconds: 5
+    batch_size: 100
 
 logging:
   level: "INFO"   # DEBUG, INFO, WARNING, ERROR
