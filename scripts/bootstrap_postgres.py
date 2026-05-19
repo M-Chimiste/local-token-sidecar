@@ -138,6 +138,11 @@ def grant_privileges(conn, database: str, writer_role: str, reader_role: str) ->
             )
         )
         cur.execute(
+            sql.SQL("GRANT SELECT (event_id) ON token_usage TO {}").format(
+                sql.Identifier(writer_role)
+            )
+        )
+        cur.execute(
             sql.SQL(
                 "GRANT SELECT ON token_usage, token_usage_daily, "
                 "token_usage_hourly, token_usage_by_model, token_usage_by_node TO {}"

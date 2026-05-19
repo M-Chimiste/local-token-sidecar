@@ -25,7 +25,8 @@ That wrapper will start the Homebrew Postgres service and then run
 - create `token_sidecar_writer` and `token_sidecar_reader` roles if needed
 - generate passwords for newly-created roles
 - create the `token_usage` table, indexes, and reporting views
-- grant writer insert access and reader select access
+- grant writer insert access plus narrow `event_id` read access for idempotent
+  uploads, and reader select access
 - write known DSNs to `~/.token_sidecar/postgres.env` with mode `0600`
 
 If you rerun it later, existing role passwords are left unchanged by default so

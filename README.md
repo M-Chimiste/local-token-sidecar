@@ -111,6 +111,10 @@ On the Mac mini, install Postgres with Homebrew, then bootstrap the database, ro
 scripts/setup_nyx_postgres.sh
 ```
 
+The writer role receives `INSERT` on `token_usage` plus narrow
+`SELECT(event_id)` access so idempotent uploads can use
+`ON CONFLICT (event_id) DO NOTHING`.
+
 The script writes known DSNs to `~/.token_sidecar/postgres.env` on `nyx`. On each sidecar machine, copy the `TOKEN_SIDECAR_POSTGRES_DSN` export from that file, set a stable `node.id`, enable central sync in `config.yaml`, and provide the writer DSN via environment variable:
 
 ```bash

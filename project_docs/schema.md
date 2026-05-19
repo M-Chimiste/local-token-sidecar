@@ -8,7 +8,7 @@
 
 SQLite stores the local hot-path outbox/cache. When central Postgres sync is disabled, it behaves like the historical local reporting database. When central sync is enabled, rows are uploaded to Postgres in the background and deleted locally after acknowledgement.
 
-Postgres stores the centralized reporting copy across machines. Timestamps are stored and queried in UTC.
+Postgres stores the centralized reporting copy across machines. Timestamps are stored and queried in UTC. The writer role needs `INSERT` on `token_usage` and `SELECT(event_id)` so idempotent uploads can use `ON CONFLICT (event_id) DO NOTHING`; reader access is handled by a separate read-only role.
 
 ---
 
