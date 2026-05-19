@@ -110,8 +110,10 @@ def insert_token_usage_batch(dsn: str, rows: Iterable[dict]) -> list[str]:
     """
     Insert a batch of queued local rows into Postgres.
 
-    Returns every attempted event_id if the transaction commits. `ON CONFLICT`
-    makes duplicate uploads idempotent, so conflicts are acknowledged too.
+    Returns every attempted event_id once each row has either been inserted or
+    found to already exist. This intentionally avoids ``ON CONFLICT`` because
+    Postgres requires extra privileges for that path on some least-privilege
+    writer roles; the sidecar writer only needs INSERT.
     """
     batch = list(rows)
     if not batch:
@@ -123,26 +125,31 @@ def insert_token_usage_batch(dsn: str, rows: Iterable[dict]) -> list[str]:
             completion_tokens, total_tokens, response_ms, endpoint, status_code
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (event_id) DO NOTHING
     """
     with _connect(dsn) as conn:
         with conn.cursor() as cur:
             for row in batch:
-                cur.execute(
-                    sql,
-                    (
-                        row["event_id"],
-                        row["timestamp"],
-                        row["node_id"],
-                        row["model"],
-                        row["prompt_tokens"],
-                        row["completion_tokens"],
-                        row["total_tokens"],
-                        row["response_ms"],
-                        row.get("endpoint") or "/v1/unknown",
-                        row.get("status_code") or 200,
-                    ),
-                )
+                try:
+                    with conn.transaction():
+                        cur.execute(
+                            sql,
+                            (
+                                row["event_id"],
+                                row["timestamp"],
+                                row["node_id"],
+                                row["model"],
+                                row["prompt_tokens"],
+                                row["completion_tokens"],
+                                row["total_tokens"],
+                                row["response_ms"],
+                                row.get("endpoint") or "/v1/unknown",
+                                row.get("status_code") or 200,
+                            ),
+                        )
+                except psycopg.errors.UniqueViolation:
+                    # Duplicate event_ids mean a previous upload succeeded but
+                    # the local acknowledgement was interrupted.
+                    pass
 
     return [str(row["event_id"]) for row in batch]
 
