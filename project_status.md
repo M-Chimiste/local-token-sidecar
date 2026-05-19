@@ -169,7 +169,7 @@
 | 4 | Add `central_sync.py` and sidecar background flusher with bounded retry backoff; Postgres is never called in the request path | ✅ |
 | 5 | Extend config with `node.id` and `database.central.*`; DSNs resolve from environment variables | ✅ |
 | 6 | Update query CLI with `--backend auto|sqlite|postgres` and `--node` filtering | ✅ |
-| 7 | Add Mac mini Postgres setup docs plus one-shot bootstrap and schema initialization scripts | ✅ |
+| 7 | Add Mac mini Postgres setup docs plus one-shot nyx setup, bootstrap, and schema initialization scripts | ✅ |
 | 8 | Verification: **84 passed + 2 skipped** across full test suite | ✅ |
 
 **Design note:** When central sync is enabled, local SQLite is a durable outbox/cache. Rows are deleted locally only after Postgres acknowledges the upload batch.
@@ -253,6 +253,7 @@ token_sidecar/
 ├── config_loader.py         ← config, node id, central sync settings
 ├── setup_launchd.py         ← LaunchAgent generation with env var support
 ├── scripts/
+│   ├── setup_nyx_postgres.sh  ← nyx Homebrew Postgres setup wrapper
 │   ├── bootstrap_postgres.py  ← central DB/role/schema/grant bootstrap
 │   └── init_postgres.py     ← central schema initializer
 └── project_docs/

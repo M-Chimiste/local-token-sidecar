@@ -15,10 +15,11 @@ brew services start postgresql
 From this repo on `nyx`, run:
 
 ```bash
-uv run python scripts/bootstrap_postgres.py --report-host nyx
+scripts/setup_nyx_postgres.sh
 ```
 
-That script will:
+That wrapper will start the Homebrew Postgres service and then run
+`scripts/bootstrap_postgres.py`, which will:
 
 - create the `token_sidecar` database if it does not exist
 - create `token_sidecar_writer` and `token_sidecar_reader` roles if needed
@@ -34,11 +35,25 @@ already-configured sidecars do not break. To intentionally rotate passwords:
 uv run python scripts/bootstrap_postgres.py --report-host nyx --rotate-passwords
 ```
 
+Or use the wrapper:
+
+```bash
+scripts/setup_nyx_postgres.sh --rotate-passwords
+```
+
 If your local admin connection is not the default Homebrew setup, pass an admin
 DSN explicitly:
 
 ```bash
 uv run python scripts/bootstrap_postgres.py \
+  --admin-dsn 'postgresql://my_admin@localhost:5432/postgres' \
+  --report-host nyx
+```
+
+The wrapper accepts the same admin DSN and report-host choices:
+
+```bash
+scripts/setup_nyx_postgres.sh \
   --admin-dsn 'postgresql://my_admin@localhost:5432/postgres' \
   --report-host nyx
 ```

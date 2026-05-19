@@ -108,7 +108,7 @@ uv run python sidecar.py --config /path/to/custom-config.yaml
 On the Mac mini, install Postgres with Homebrew, then bootstrap the database, roles, schema, grants, and local env file:
 
 ```bash
-uv run python scripts/bootstrap_postgres.py --report-host nyx
+scripts/setup_nyx_postgres.sh
 ```
 
 The script writes known DSNs to `~/.token_sidecar/postgres.env` on `nyx`. On each sidecar machine, copy the `TOKEN_SIDECAR_POSTGRES_DSN` export from that file, set a stable `node.id`, enable central sync in `config.yaml`, and provide the writer DSN via environment variable:
@@ -322,6 +322,7 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 | `config_loader.py` | YAML config loader with typed `Config` dataclass and `--config` CLI override |
 | `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (manual alternative) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
+| `scripts/setup_nyx_postgres.sh` | One-shot nyx setup wrapper: start Homebrew Postgres and run central bootstrap |
 | `scripts/bootstrap_postgres.py` | One-shot central Postgres database, role, schema, and grant bootstrap |
 | `scripts/init_postgres.py` | Create central Postgres table, indexes, and reporting views |
 | `install.sh` | One-step install: dependencies, DB init, plist generation, optional launchd load |

@@ -25,6 +25,7 @@ scripts/*
 !scripts/
 !scripts/bootstrap_postgres.py
 !scripts/init_postgres.py
+!scripts/setup_nyx_postgres.sh
 
 # Editor
 .vscode/
