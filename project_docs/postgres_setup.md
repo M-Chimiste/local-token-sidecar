@@ -8,7 +8,39 @@ over Tailscale.
 ```bash
 brew install postgresql
 brew services start postgresql
-createdb token_sidecar
+```
+
+## Bootstrap Database, Roles, Schema, And Grants
+
+From this repo on `nyx`, run:
+
+```bash
+uv run python scripts/bootstrap_postgres.py --report-host nyx
+```
+
+That script will:
+
+- create the `token_sidecar` database if it does not exist
+- create `token_sidecar_writer` and `token_sidecar_reader` roles if needed
+- generate passwords for newly-created roles
+- create the `token_usage` table, indexes, and reporting views
+- grant writer insert access and reader select access
+- write known DSNs to `~/.token_sidecar/postgres.env` with mode `0600`
+
+If you rerun it later, existing role passwords are left unchanged by default so
+already-configured sidecars do not break. To intentionally rotate passwords:
+
+```bash
+uv run python scripts/bootstrap_postgres.py --report-host nyx --rotate-passwords
+```
+
+If your local admin connection is not the default Homebrew setup, pass an admin
+DSN explicitly:
+
+```bash
+uv run python scripts/bootstrap_postgres.py \
+  --admin-dsn 'postgresql://my_admin@localhost:5432/postgres' \
+  --report-host nyx
 ```
 
 Bind Postgres to the Mac mini's Tailscale IP/name, not the public internet. A
@@ -31,37 +63,6 @@ Restart after config edits:
 brew services restart postgresql
 ```
 
-## Roles
-
-Run as a local Postgres admin on the Mac mini and replace the passwords:
-
-```sql
-CREATE ROLE token_sidecar_writer LOGIN PASSWORD 'replace-writer-password';
-CREATE ROLE token_sidecar_reader LOGIN PASSWORD 'replace-reader-password';
-
-GRANT CONNECT ON DATABASE token_sidecar TO token_sidecar_writer;
-GRANT CONNECT ON DATABASE token_sidecar TO token_sidecar_reader;
-```
-
-Initialise the table, indexes, and views:
-
-```bash
-TOKEN_SIDECAR_ADMIN_DSN='postgresql://<admin>@localhost:5432/token_sidecar' \
-  uv run python scripts/init_postgres.py
-```
-
-Then grant writer/read-only access:
-
-```sql
-GRANT USAGE ON SCHEMA public TO token_sidecar_writer, token_sidecar_reader;
-GRANT INSERT ON token_usage TO token_sidecar_writer;
-GRANT SELECT ON token_usage TO token_sidecar_reader;
-GRANT SELECT ON token_usage_daily TO token_sidecar_reader;
-GRANT SELECT ON token_usage_hourly TO token_sidecar_reader;
-GRANT SELECT ON token_usage_by_model TO token_sidecar_reader;
-GRANT SELECT ON token_usage_by_node TO token_sidecar_reader;
-```
-
 ## Sidecar Machines
 
 Set a stable `node.id` in each machine's `config.yaml`, then enable central
@@ -81,10 +82,12 @@ database:
     batch_size: 100
 ```
 
-Export the writer DSN before running manually or installing the LaunchAgent:
+Copy the `TOKEN_SIDECAR_POSTGRES_DSN` export from `nyx`'s
+`~/.token_sidecar/postgres.env`, then export it before running manually or
+installing the LaunchAgent:
 
 ```bash
-export TOKEN_SIDECAR_POSTGRES_DSN='postgresql://token_sidecar_writer:replace-writer-password@mac-mini.tailnet-name.ts.net:5432/token_sidecar'
+source ~/.token_sidecar/postgres.env
 uv run python setup_launchd.py install
 ```
 
@@ -96,6 +99,6 @@ with mode `0600` when central sync is enabled.
 Use the reader DSN for CLI reporting and future dashboards:
 
 ```bash
-TOKEN_SIDECAR_QUERY_DSN='postgresql://token_sidecar_reader:replace-reader-password@mac-mini.tailnet-name.ts.net:5432/token_sidecar' \
-  uv run python -m queries.summary by-model --backend postgres --format table
+source ~/.token_sidecar/postgres.env
+uv run python -m queries.summary by-model --backend postgres --format table
 ```

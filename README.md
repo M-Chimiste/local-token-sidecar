@@ -105,17 +105,16 @@ uv run python sidecar.py --config /path/to/custom-config.yaml
 
 ## Central Postgres reporting
 
-On the Mac mini, install Postgres with Homebrew and create a database reachable over Tailscale. Initialise the reporting schema with:
+On the Mac mini, install Postgres with Homebrew, then bootstrap the database, roles, schema, grants, and local env file:
 
 ```bash
-TOKEN_SIDECAR_ADMIN_DSN='postgresql://admin@mac-mini.tailnet-name.ts.net:5432/token_sidecar' \
-  uv run python scripts/init_postgres.py
+uv run python scripts/bootstrap_postgres.py --report-host nyx
 ```
 
-On each sidecar machine, set a stable `node.id`, enable central sync in `config.yaml`, and provide the writer DSN via environment variable:
+The script writes known DSNs to `~/.token_sidecar/postgres.env` on `nyx`. On each sidecar machine, copy the `TOKEN_SIDECAR_POSTGRES_DSN` export from that file, set a stable `node.id`, enable central sync in `config.yaml`, and provide the writer DSN via environment variable:
 
 ```bash
-export TOKEN_SIDECAR_POSTGRES_DSN='postgresql://token_sidecar_writer:password@mac-mini.tailnet-name.ts.net:5432/token_sidecar'
+source ~/.token_sidecar/postgres.env
 uv run python sidecar.py
 ```
 
@@ -323,6 +322,7 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 | `config_loader.py` | YAML config loader with typed `Config` dataclass and `--config` CLI override |
 | `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (manual alternative) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
+| `scripts/bootstrap_postgres.py` | One-shot central Postgres database, role, schema, and grant bootstrap |
 | `scripts/init_postgres.py` | Create central Postgres table, indexes, and reporting views |
 | `install.sh` | One-step install: dependencies, DB init, plist generation, optional launchd load |
 | `uninstall.sh` | Clean removal: unload LaunchAgent, optionally purge data and uv env |

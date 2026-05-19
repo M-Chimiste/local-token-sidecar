@@ -97,7 +97,7 @@ async def forward_and_intercept(
                 url=f"{upstream_url}{request.path}",
                 headers=upstream_headers,
                 data=body_bytes,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=None),
             ) as upstream_resp:
                 response_body = await upstream_resp.read()
                 elapsed_ms = (time.perf_counter() - start_ms) * 1000
