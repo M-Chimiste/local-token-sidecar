@@ -3,8 +3,17 @@ proxy:
   listen_port: 1240          # sidecar binds here; forwards to LM Studio upstream_url
   upstream_url: "http://localhost:1234"
 
+node:
+  id: "athena"               # stable machine id for central reporting
+
 database:
   path: "~/.token_sidecar/tokens.db"
+  central:
+    enabled: true
+    driver: "postgres"
+    dsn_env: "TOKEN_SIDECAR_POSTGRES_DSN"
+    flush_interval_seconds: 5
+    batch_size: 100
 
 logging:
   level: "INFO"   # DEBUG, INFO, WARNING, ERROR
@@ -14,7 +23,7 @@ launchd:
   label: "com.athena.token-sidecar"
 
 dashboard:
-  enabled: true                  # gate for setup_launchd.py install --service dashboard
+  enabled: false                 # inference server: dashboard disabled
   listen_host: "0.0.0.0"
   listen_port: 8088
   feed_initial_rows: 50
