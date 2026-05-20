@@ -143,8 +143,12 @@ class FakePool:
             return [((max_ts - min_ts).total_seconds(),)]
         if "GROUP BY day" in sql:
             rows = self._apply_filter_params(self._live(), sql, params)
-            # 14-day cutoff bound; just trust the param window
-            window_start = params[0] if params and isinstance(params[0], datetime) else NOW_UTC - timedelta(days=14)
+            # 14-day cutoff bound; the first datetime param is spark_start
+            # (a string `tz` may precede it once tz parameterization lands).
+            window_start = next(
+                (p for p in params if isinstance(p, datetime)),
+                NOW_UTC - timedelta(days=14),
+            )
             rows = [r for r in rows if r["timestamp"] >= window_start]
             buckets = {}
             for r in rows:

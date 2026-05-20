@@ -15,24 +15,37 @@ import dashboard
 
 # ───────────────────────── range_bound_sql ──────────────────────────────
 
-def test_range_bound_sql_1d_uses_utc_date_equality():
+def test_range_bound_sql_1d_uses_parameterized_tz_date_equality():
     sql, params = dashboard.range_bound_sql("1d")
-    assert "AT TIME ZONE 'UTC'" in sql
+    assert "AT TIME ZONE %s" in sql
     assert "::date" in sql
-    assert "= (now() AT TIME ZONE 'UTC')::date" in sql
-    assert params == []
+    assert "= (now() AT TIME ZONE %s)::date" in sql
+    assert params == ["UTC", "UTC"]
+
+
+def test_range_bound_sql_default_tz_is_utc():
+    """Calling without an explicit tz preserves the old UTC behavior."""
+    sql_default, params_default = dashboard.range_bound_sql("1d")
+    sql_utc, params_utc = dashboard.range_bound_sql("1d", "UTC")
+    assert (sql_default, params_default) == (sql_utc, params_utc)
+
+
+def test_range_bound_sql_threads_tz_into_params():
+    sql, params = dashboard.range_bound_sql("7d", "America/New_York")
+    assert "AT TIME ZONE %s" in sql
+    assert params == ["America/New_York", "America/New_York"]
 
 
 def test_range_bound_sql_7d_uses_six_day_offset():
     sql, params = dashboard.range_bound_sql("7d")
     assert "INTERVAL '6 days'" in sql
-    assert params == []
+    assert params == ["UTC", "UTC"]
 
 
 def test_range_bound_sql_30d_uses_twentynine_day_offset():
     sql, params = dashboard.range_bound_sql("30d")
     assert "INTERVAL '29 days'" in sql
-    assert params == []
+    assert params == ["UTC", "UTC"]
 
 
 def test_range_bound_sql_all_emits_no_filter():

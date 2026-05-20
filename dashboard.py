@@ -27,10 +27,16 @@ import pathlib
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, available_timezones
 
 from aiohttp import web
 
 from config_loader import Config, load_config, parse_cli_args
+
+
+# Cache the IANA timezone whitelist once at import — used to validate the
+# `tz` query parameter before passing it through to Postgres `AT TIME ZONE`.
+_VALID_TIMEZONES = available_timezones()
 
 
 logger = logging.getLogger("dashboard")
@@ -68,32 +74,33 @@ VALID_RANGES = ("1d", "7d", "30d", "all")
 VALID_GRAN = ("hour", "day", "week")
 
 
-def range_bound_sql(range_key: str) -> tuple[str, list[Any]]:
+def range_bound_sql(range_key: str, tz: str = "UTC") -> tuple[str, list[Any]]:
     """
     Return a SQL fragment (starting with ' AND ...') and its params that
-    restricts `timestamp` to the requested range, anchored in UTC.
+    restricts `timestamp` to the requested range, anchored in the given
+    IANA timezone (default UTC).
 
-    `(timestamp AT TIME ZONE 'UTC')::date` is compared against a UTC-anchored
-    date arithmetic expression so the result does not depend on the Postgres
-    session timezone.
+    `(timestamp AT TIME ZONE %s)::date` is compared against a
+    similarly-anchored `now()` date so the result does not depend on the
+    Postgres session timezone and follows the caller's local "today".
     """
     if range_key == "1d":
         return (
-            " AND (timestamp AT TIME ZONE 'UTC')::date"
-            " = (now() AT TIME ZONE 'UTC')::date",
-            [],
+            " AND (timestamp AT TIME ZONE %s)::date"
+            " = (now() AT TIME ZONE %s)::date",
+            [tz, tz],
         )
     if range_key == "7d":
         return (
-            " AND (timestamp AT TIME ZONE 'UTC')::date"
-            " >= (now() AT TIME ZONE 'UTC')::date - INTERVAL '6 days'",
-            [],
+            " AND (timestamp AT TIME ZONE %s)::date"
+            " >= (now() AT TIME ZONE %s)::date - INTERVAL '6 days'",
+            [tz, tz],
         )
     if range_key == "30d":
         return (
-            " AND (timestamp AT TIME ZONE 'UTC')::date"
-            " >= (now() AT TIME ZONE 'UTC')::date - INTERVAL '29 days'",
-            [],
+            " AND (timestamp AT TIME ZONE %s)::date"
+            " >= (now() AT TIME ZONE %s)::date - INTERVAL '29 days'",
+            [tz, tz],
         )
     if range_key == "all":
         return ("", [])
@@ -169,6 +176,18 @@ def _parse_filters(request: web.Request) -> tuple[list[str], list[str]]:
     return models, nodes
 
 
+def _parse_tz(request: web.Request) -> str:
+    """
+    Parse and validate the `tz` query parameter against the IANA timezone
+    whitelist. Defaults to 'UTC' when missing. Rejects unknown values so
+    arbitrary strings never reach Postgres `AT TIME ZONE`.
+    """
+    tz = (request.query.get("tz") or "UTC").strip() or "UTC"
+    if tz not in _VALID_TIMEZONES:
+        raise web.HTTPBadRequest(reason=f"unknown tz: {tz!r}")
+    return tz
+
+
 def _iso(ts: datetime) -> str:
     """Render a UTC timestamptz as ISO with trailing 'Z'."""
     if ts.tzinfo is None:
@@ -239,13 +258,19 @@ async def handle_meta(request: web.Request) -> web.Response:
 
 async def handle_kpi(request: web.Request) -> web.Response:
     pool = request.app["pool"]
+    tz = _parse_tz(request)
     models, nodes = _parse_filters(request)
     fsql, fparams = filter_sql(models, nodes)
 
-    now_utc = datetime.now(timezone.utc)
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    # All day boundaries are computed in the caller's local tz so that
+    # "today" / "yesterday" match the viewer's wall clock, not the server's
+    # UTC offset. The resulting aware datetimes pass through psycopg as
+    # timestamptz and compare correctly against the stored UTC timestamps.
+    zi = ZoneInfo(tz)
+    now_local = datetime.now(zi)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
-    yesterday_cutoff = yesterday_start + (now_utc - today_start)
+    yesterday_cutoff = yesterday_start + (now_local - today_start)
     spark_start = (today_start - timedelta(days=13))
 
     kpi_sql = (
@@ -262,7 +287,7 @@ async def handle_kpi(request: web.Request) -> web.Response:
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(kpi_sql, [today_start, now_utc, *fparams])
+            await cur.execute(kpi_sql, [today_start, now_local, *fparams])
             tok, req, avg_ms, models_ct = (await cur.fetchone()) or (0, 0, 0.0, 0)
             today = {"tok": int(tok), "req": int(req), "avgMs": float(avg_ms), "models": int(models_ct)}
 
@@ -272,7 +297,7 @@ async def handle_kpi(request: web.Request) -> web.Response:
 
             await cur.execute(
                 "SELECT"
-                "  (timestamp AT TIME ZONE 'UTC')::date AS day,"
+                "  (timestamp AT TIME ZONE %s)::date AS day,"
                 "  COALESCE(SUM(total_tokens), 0)::bigint AS tok,"
                 "  COUNT(*) AS req,"
                 "  COALESCE(AVG(response_ms), 0) AS ms,"
@@ -282,7 +307,7 @@ async def handle_kpi(request: web.Request) -> web.Response:
                 "   AND timestamp >= %s"
                 + fsql +
                 " GROUP BY day ORDER BY day ASC",
-                [spark_start, *fparams],
+                [tz, spark_start, *fparams],
             )
             rows = await cur.fetchall()
 
@@ -301,10 +326,11 @@ async def handle_kpi(request: web.Request) -> web.Response:
 
 async def handle_buckets(request: web.Request) -> web.Response:
     pool = request.app["pool"]
+    tz = _parse_tz(request)
     range_key = _parse_range(request)
     models, nodes = _parse_filters(request)
     fsql, fparams = filter_sql(models, nodes)
-    rsql, rparams = range_bound_sql(range_key)
+    rsql, rparams = range_bound_sql(range_key, tz)
 
     span_seconds: float | None = None
     if range_key == "all":
@@ -324,7 +350,7 @@ async def handle_buckets(request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError(reason="bad granularity")
 
     sql = (
-        f"SELECT date_trunc('{gran}', timestamp AT TIME ZONE 'UTC') AS bucket,"
+        f"SELECT date_trunc('{gran}', timestamp AT TIME ZONE %s) AS bucket,"
         "       model,"
         "       COALESCE(SUM(total_tokens), 0)::bigint AS tok,"
         "       COUNT(*)::bigint                       AS calls"
@@ -336,13 +362,15 @@ async def handle_buckets(request: web.Request) -> web.Response:
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(sql, [*rparams, *fparams])
+            await cur.execute(sql, [tz, *rparams, *fparams])
             rows = await cur.fetchall()
 
     buckets: dict[str, dict[str, Any]] = {}
     for bucket_dt, model, tok, calls in rows:
-        # bucket_dt comes back as a naive datetime (UTC wall clock) because
-        # date_trunc applied AT TIME ZONE 'UTC' returns timestamp w/o TZ.
+        # bucket_dt comes back as a naive datetime — wall-clock midnight in
+        # the requested tz, returned by `date_trunc(... AT TIME ZONE tz)`.
+        # Label/key formatting via strftime ignores tzinfo, so the attached
+        # UTC tag is purely cosmetic.
         if bucket_dt.tzinfo is None:
             bucket_dt = bucket_dt.replace(tzinfo=timezone.utc)
         k = bucket_key(bucket_dt, gran)
@@ -366,10 +394,11 @@ async def handle_buckets(request: web.Request) -> web.Response:
 
 async def handle_leaderboard(request: web.Request) -> web.Response:
     pool = request.app["pool"]
+    tz = _parse_tz(request)
     range_key = _parse_range(request)
     models, nodes = _parse_filters(request)
     fsql, fparams = filter_sql(models, nodes)
-    rsql, rparams = range_bound_sql(range_key)
+    rsql, rparams = range_bound_sql(range_key, tz)
 
     sql = (
         "SELECT model,"
@@ -398,10 +427,11 @@ async def handle_leaderboard(request: web.Request) -> web.Response:
 
 async def handle_by_host(request: web.Request) -> web.Response:
     pool = request.app["pool"]
+    tz = _parse_tz(request)
     range_key = _parse_range(request)
     models, nodes = _parse_filters(request)
     fsql, fparams = filter_sql(models, nodes)
-    rsql, rparams = range_bound_sql(range_key)
+    rsql, rparams = range_bound_sql(range_key, tz)
 
     sql = (
         "SELECT node_id, model,"

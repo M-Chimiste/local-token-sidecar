@@ -15,6 +15,14 @@ const POLL_INTERVAL_MS = 2200;
 // so they catch up to new rows without thrashing Postgres.
 const HEAVY_REFRESH_EVERY = 10;
 
+// Browser's IANA timezone, threaded into every API call so the server
+// computes "today" / "yesterday" / chart buckets in the viewer's local
+// wall clock instead of UTC.
+const TZ = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+  catch (_) { return 'UTC'; }
+})();
+
 // ───────────────────────── helpers ───────────────────────────────────────
 
 function buildQS(params) {
@@ -49,13 +57,63 @@ function pctDelta(today, yest) {
   return (today - yest) / yest;
 }
 
+// ───────────────────────── Theme ─────────────────────────────────────────
+// Preference is one of 'auto' | 'quiet' | 'terminal', stored under
+// localStorage key 'ts-theme'. The effective data-theme is always 'quiet'
+// or 'terminal'; 'auto' resolves via prefers-color-scheme at render and
+// re-resolves live when the OS setting changes. A pre-paint script in
+// index.html sets the same attribute synchronously so dark-OS users don't
+// see a light-mode flash on first load.
+const THEME_KEY = 'ts-theme';
+const THEME_PREFS = ['auto', 'quiet', 'terminal'];
+
+function useTheme() {
+  const [pref, setPrefState] = React.useState(() => {
+    try {
+      const v = localStorage.getItem(THEME_KEY);
+      return THEME_PREFS.includes(v) ? v : 'auto';
+    } catch (_) {
+      return 'auto';
+    }
+  });
+  const [osDark, setOsDark] = React.useState(() =>
+    typeof window !== 'undefined'
+      && window.matchMedia
+      && window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+
+  // Track OS dark-mode changes only while in auto.
+  React.useEffect(() => {
+    if (pref !== 'auto') return undefined;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = (e) => setOsDark(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [pref]);
+
+  const effective = pref === 'auto' ? (osDark ? 'terminal' : 'quiet') : pref;
+
+  React.useEffect(() => {
+    document.documentElement.setAttribute('data-theme', effective);
+  }, [effective]);
+
+  const setPref = React.useCallback((next) => {
+    setPrefState(next);
+    try { localStorage.setItem(THEME_KEY, next); } catch (_) { /* private mode */ }
+  }, []);
+
+  return { pref, setPref, effective };
+}
+
 // ───────────────────────── App ───────────────────────────────────────────
 
 function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
-  React.useEffect(() => {
-    document.documentElement.setAttribute('data-theme', t.theme);
-  }, [t.theme]);
+  const { pref: themePref, setPref: setThemePref, effective: themeEffective } = useTheme();
+  const cycleTheme = React.useCallback(() => {
+    const next = { auto: 'quiet', quiet: 'terminal', terminal: 'auto' }[themePref] || 'auto';
+    setThemePref(next);
+  }, [themePref, setThemePref]);
 
   // ─── Server-backed state
   const [meta, setMeta]               = React.useState({ now: null, models: [], hosts: [] });
@@ -93,11 +151,15 @@ function App() {
     return Array.from(selectedModels);
   }, [selectedModels, meta.models]);
 
-  // ─── Live UTC clock
+  // ─── Live local clock (HH:MM:SS + short tz name, e.g. "21:14:32 EDT")
   React.useEffect(() => {
+    const tzFmt = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' });
     const update = () => {
       const d = new Date(Date.now());
-      setClockStr(d.toUTCString().slice(17, 25) + ' UTC');
+      const hms = [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map(n => String(n).padStart(2, '0')).join(':');
+      const tzPart = tzFmt.formatToParts(d).find(p => p.type === 'timeZoneName');
+      setClockStr(`${hms} ${tzPart ? tzPart.value : ''}`.trim());
     };
     update();
     const i = setInterval(update, 1000);
@@ -134,8 +196,8 @@ function App() {
     let cancelled = false;
     if (!meta.now) return;  // wait for bootstrap
     (async () => {
-      const q = buildQS({ range, model: filterModels || undefined });
-      const kpiQ = buildQS({ model: filterModels || undefined });
+      const q = buildQS({ range, model: filterModels || undefined, tz: TZ });
+      const kpiQ = buildQS({ model: filterModels || undefined, tz: TZ });
       try {
         const [k, b, lb, bh] = await Promise.all([
           jget('/api/kpi'         + kpiQ),
@@ -186,8 +248,8 @@ function App() {
         }
 
         if (tickCountRef.current % HEAVY_REFRESH_EVERY === 0) {
-          const q = buildQS({ range, model: filterModels || undefined });
-          const kpiQ = buildQS({ model: filterModels || undefined });
+          const q = buildQS({ range, model: filterModels || undefined, tz: TZ });
+          const kpiQ = buildQS({ model: filterModels || undefined, tz: TZ });
           const [k, b, lb, bh] = await Promise.all([
             jget('/api/kpi'         + kpiQ),
             jget('/api/buckets'     + q),
@@ -240,6 +302,7 @@ function App() {
             </div>
           </div>
           <div className="hdr-r">
+            <ThemeToggle pref={themePref} effective={themeEffective} onCycle={cycleTheme} />
             <span className={`live-dot${liveOn ? '' : ' paused'}`}>{liveOn ? 'live' : 'paused'}</span>
             <span className="hdr-clock">{clockStr}</span>
           </div>

@@ -15,14 +15,37 @@ const fmt = {
   hour: (h) => String(h).padStart(2, '0') + ':00',
   shortDate: (iso) => {
     const d = new Date(iso);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   },
   hms: (iso) => {
     const d = new Date(iso);
-    return [d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()]
+    return [d.getHours(), d.getMinutes(), d.getSeconds()]
       .map(n => String(n).padStart(2, '0')).join(':');
   },
 };
+
+// ───────────────────────── Theme toggle ─────────────────────────────────
+// Single cycling button: auto → quiet → terminal → auto. The dot is shown
+// when pref is 'auto' so the user can tell the OS is driving the choice.
+function ThemeToggle({ pref, effective, onCycle }) {
+  const glyph = effective === 'terminal' ? '☾' : '☀';
+  const nextLabel = ({ auto: 'light', quiet: 'dark', terminal: 'auto' })[pref];
+  const stateLabel = pref === 'auto'
+    ? `Auto (${effective === 'terminal' ? 'dark' : 'light'})`
+    : (pref === 'quiet' ? 'Light' : 'Dark');
+  return (
+    <button
+      type="button"
+      className="theme-toggle"
+      onClick={onCycle}
+      title={`Theme: ${stateLabel} — click for ${nextLabel}`}
+      aria-label={`Theme: ${stateLabel}. Click to switch to ${nextLabel}.`}
+    >
+      <span className="theme-toggle-glyph">{glyph}</span>
+      {pref === 'auto' && <span className="theme-toggle-auto">auto</span>}
+    </button>
+  );
+}
 
 // ───────────────────────── KPI tile ─────────────────────────────────────
 function KPI({ label, value, unit, delta, deltaLabel, spark, color }) {
