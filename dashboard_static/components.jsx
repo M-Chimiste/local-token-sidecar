@@ -337,13 +337,12 @@ function ActivityFeed({ rows, modelColors, newIds }) {
       {rows.map(r => (
         <div key={r.id} className={`feed-row${newIds.has(r.id) ? ' new' : ''}`}>
           <span className="t">{fmt.hms(r.ts)}</span>
-          <span className="h">{r.host}</span>
-          <span className="m" style={{ '--c': modelColors[r.model] }}>
-            <span className="dot"></span>{r.model}
+          <span className="h" title={r.host}>{r.host}</span>
+          <span className="m" style={{ '--c': modelColors[r.model] }} title={r.model}>
+            <span className="dot"></span>
+            <span className="m-name">{r.model}</span>
           </span>
-          <span style={{ color: 'var(--text-3)', fontSize: '10.5px' }}>
-            {fmt.int(r.prompt)}&nbsp;in / {fmt.int(r.completion)}&nbsp;out
-          </span>
+          <span className="io">{fmt.int(r.prompt)} in / {fmt.int(r.completion)} out</span>
           <span className="toks">{fmt.int(r.total)}</span>
           <span className="ms">{fmt.ms(r.ms)}</span>
         </div>
