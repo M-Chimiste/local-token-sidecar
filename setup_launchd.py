@@ -31,14 +31,27 @@ PROJECT_ROOT = pathlib.Path(__file__).parent.resolve()
 PLIST_LABEL = "com.athena.token-sidecar"
 PLIST_FILENAME = f"{PLIST_LABEL}.plist"
 
+DASHBOARD_PLIST_LABEL = "com.athena.token-sidecar-dashboard"
+DASHBOARD_PLIST_FILENAME = f"{DASHBOARD_PLIST_LABEL}.plist"
+
+# Optional env file the dashboard plist sources to get TOKEN_SIDECAR_QUERY_DSN
+# without baking secrets into the plist.
+DASHBOARD_ENV_FILE = pathlib.Path.home() / ".token_sidecar" / "env.sh"
+
 
 def _get_launch_agents_dir() -> pathlib.Path:
     home = pathlib.Path.home()
     return home / "Library" / "LaunchAgents"
 
 
-def _get_plist_path() -> pathlib.Path:
+def _get_plist_path(service: str = "sidecar") -> pathlib.Path:
+    if service == "dashboard":
+        return _get_launch_agents_dir() / DASHBOARD_PLIST_FILENAME
     return _get_launch_agents_dir() / PLIST_FILENAME
+
+
+def _label_for(service: str) -> str:
+    return DASHBOARD_PLIST_LABEL if service == "dashboard" else PLIST_LABEL
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +100,112 @@ def generate_plist_content(
     return buf.decode("utf-8")
 
 
+def generate_dashboard_plist_content(
+    project_dir: pathlib.Path,
+    dashboard_script: pathlib.Path,
+    log_out_path: pathlib.Path,
+    log_err_path: pathlib.Path,
+) -> str:
+    """
+    Build the dashboard LaunchAgent plist.
+
+    Uses a /bin/sh wrapper that conditionally sources ~/.token_sidecar/env.sh
+    (so a missing env file does NOT abort before python runs). When DSN is
+    unset, dashboard.py exits 0 and KeepAlive: {SuccessfulExit: false} keeps
+    the agent down — no crash loop.
+    """
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python3"
+    python_exe = pathlib.Path(os.path.abspath(str(venv_python)))
+    dashboard_path = dashboard_script.resolve()
+
+    wrapper = (
+        f'if [ -f "{DASHBOARD_ENV_FILE}" ]; then . "{DASHBOARD_ENV_FILE}"; fi; '
+        f'exec "{python_exe}" "{dashboard_path}"'
+    )
+
+    plist_data = {
+        "Label": DASHBOARD_PLIST_LABEL,
+        "ProgramArguments": ["/bin/sh", "-c", wrapper],
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": str(log_out_path),
+        "StandardErrorPath": str(log_err_path),
+        "WorkingDirectory": str(project_dir),
+        "ProcessType": "Background",
+    }
+
+    buf = plistlib.dumps(plist_data, sort_keys=False)
+    return buf.decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks (dashboard install)
+# ---------------------------------------------------------------------------
+
+def _dashboard_preflight(cfg) -> list[str]:
+    """
+    Return a list of human-readable failure messages. Empty list means OK.
+
+    Checks:
+      1. config.dashboard.enabled is True
+      2. TOKEN_SIDECAR_QUERY_DSN is set in current env, OR ~/.token_sidecar/env.sh
+         exists and exports it
+      3. psycopg / psycopg_pool imports succeed in the active venv
+      4. SELECT 1 round-trip against the DSN succeeds
+    """
+    errors: list[str] = []
+
+    if not cfg.dashboard.enabled:
+        errors.append(
+            "config.yaml: dashboard.enabled is false. "
+            "Flip it to true on the postgres box before installing the dashboard plist."
+        )
+
+    dsn = os.environ.get("TOKEN_SIDECAR_QUERY_DSN", "").strip()
+    if not dsn:
+        if DASHBOARD_ENV_FILE.exists():
+            try:
+                contents = DASHBOARD_ENV_FILE.read_text()
+            except OSError as exc:
+                errors.append(f"could not read {DASHBOARD_ENV_FILE}: {exc}")
+                contents = ""
+            if "TOKEN_SIDECAR_QUERY_DSN" not in contents:
+                errors.append(
+                    f"{DASHBOARD_ENV_FILE} exists but does not export "
+                    f"TOKEN_SIDECAR_QUERY_DSN. Add: "
+                    f"export TOKEN_SIDECAR_QUERY_DSN=postgresql://..."
+                )
+        else:
+            errors.append(
+                f"TOKEN_SIDECAR_QUERY_DSN is not set in this shell and "
+                f"{DASHBOARD_ENV_FILE} does not exist. Create it with:\n"
+                f"    mkdir -p {DASHBOARD_ENV_FILE.parent}\n"
+                f"    echo 'export TOKEN_SIDECAR_QUERY_DSN=postgresql://...' > {DASHBOARD_ENV_FILE}\n"
+                f"    chmod 600 {DASHBOARD_ENV_FILE}"
+            )
+
+    try:
+        import psycopg  # noqa: F401
+        import psycopg_pool  # noqa: F401
+    except ImportError as exc:
+        errors.append(
+            f"psycopg/psycopg_pool not importable in the active venv: {exc}. "
+            f"Run `uv sync` from {PROJECT_ROOT}."
+        )
+
+    if dsn and not errors:
+        try:
+            import psycopg
+            with psycopg.connect(dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+        except Exception as exc:
+            errors.append(f"could not reach Postgres with TOKEN_SIDECAR_QUERY_DSN: {exc}")
+
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
@@ -104,10 +223,13 @@ def _current_uid() -> str:
     return str(os.getuid())
 
 
-def install(config_path: Optional[str] = None) -> None:
+def install(config_path: Optional[str] = None, service: str = "sidecar") -> None:
     """
     Load config, generate the plist XML, and write it to ~/Library/LaunchAgents/.
     Prints instructions for loading the agent.
+
+    For service == "dashboard", a pre-flight checks DSN reachability and
+    config.dashboard.enabled before any state is written.
     """
     # Guard against root — LaunchAgent is a user-space concept
     if os.geteuid() == 0:
@@ -118,37 +240,43 @@ def install(config_path: Optional[str] = None) -> None:
     from config_loader import load_config
     cfg = load_config(config_path)
 
-    # Sidecar script and project root
-    sidecar_script = PROJECT_ROOT / "sidecar.py"
-
     # Log paths under ~/.token_sidecar/
     log_dir = pathlib.Path(cfg.database_path).parent.resolve()
-    log_out_path = log_dir / "sidecar.log"
-    log_err_path = log_dir / "sidecar.error.log"
-
-    # Ensure the directory exists with restricted permissions
     log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    plist_content = generate_plist_content(
-        project_dir=PROJECT_ROOT,
-        sidecar_script=sidecar_script,
-        log_out_path=log_out_path,
-        log_err_path=log_err_path,
-    )
+    if service == "dashboard":
+        errors = _dashboard_preflight(cfg)
+        if errors:
+            sys.stderr.write("ERROR: dashboard pre-flight checks failed:\n")
+            for e in errors:
+                sys.stderr.write(f"  - {e}\n")
+            sys.exit(1)
 
-    plist_path = _get_plist_path()
+        plist_content = generate_dashboard_plist_content(
+            project_dir=PROJECT_ROOT,
+            dashboard_script=PROJECT_ROOT / "dashboard.py",
+            log_out_path=log_dir / "dashboard.log",
+            log_err_path=log_dir / "dashboard.error.log",
+        )
+    else:
+        plist_content = generate_plist_content(
+            project_dir=PROJECT_ROOT,
+            sidecar_script=PROJECT_ROOT / "sidecar.py",
+            log_out_path=log_dir / "sidecar.log",
+            log_err_path=log_dir / "sidecar.error.log",
+        )
 
-    # Write plist
+    plist_path = _get_plist_path(service)
+
     with open(plist_path, "w", encoding="utf-8") as fh:
         fh.write(plist_content)
-    # Secure: user-only read/write on the plist itself (same perms as directory)
     os.chmod(plist_path, 0o644)
 
     print(f"Plist written to:\n  {plist_path}\n")
-    _print_load_instructions()
+    _print_load_instructions(service)
 
 
-def unload() -> None:
+def unload(service: str = "sidecar") -> None:
     """
     Stop the LaunchAgent (unload from launchd) without removing the plist file.
     Idempotent — does not error if already unloaded.
@@ -156,27 +284,28 @@ def unload() -> None:
     if os.geteuid() == 0:
         sys.exit("ERROR: Do not run as root.")
 
+    label = _label_for(service)
     domain = f"gui/{_current_uid()}"
 
     try:
-        _run_launchctl(["bootout", domain, PLIST_LABEL], check=True)
-        print(f"Unloaded: {PLIST_LABEL}")
+        _run_launchctl(["bootout", domain, label], check=True)
+        print(f"Unloaded: {label}")
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
         if "could not find" in stderr.lower() or "not loaded" in stderr.lower():
-            print(f"Already unloaded (or never loaded): {PLIST_LABEL}")
+            print(f"Already unloaded (or never loaded): {label}")
         else:
             sys.exit(f"launchctl bootout failed:\n{stderr}")
 
 
-def remove() -> None:
+def remove(service: str = "sidecar") -> None:
     """Stop the agent and delete the plist file."""
     if os.geteuid() == 0:
         sys.exit("ERROR: Do not run as root.")
 
-    unload()
+    unload(service)
 
-    plist_path = _get_plist_path()
+    plist_path = _get_plist_path(service)
     if plist_path.exists():
         plist_path.unlink()
         print(f"Removed plist: {plist_path}")
@@ -184,43 +313,45 @@ def remove() -> None:
         print(f"No plist file found at {plist_path} (nothing to remove)")
 
 
-def status() -> None:
+def status(service: str = "sidecar") -> None:
     """Check and display the current launchd state of the agent."""
     if os.geteuid() == 0:
         sys.exit("ERROR: Do not run as root.")
 
-    plist_path = _get_plist_path()
+    label = _label_for(service)
+    plist_path = _get_plist_path(service)
 
     # Use `launchctl list` to check if a named job is currently loaded.
     # This works reliably regardless of TTY state (unlike `print` which
     # emits domain info in non-TTY contexts even when label is unknown).
     try:
-        result = _run_launchctl(["list", PLIST_LABEL], check=True)
+        result = _run_launchctl(["list", label], check=True)
         stdout = result.stdout.decode("utf-8", errors="replace")
         if stdout.strip():
-            print(f"[LOADED]   {PLIST_LABEL}")
+            print(f"[LOADED]   {label}")
         else:
             # Empty output means no process with this label
-            print(f"[UNLOADED] {PLIST_LABEL}")
-    except subprocess.CalledProcessError as exc:
+            print(f"[UNLOADED] {label}")
+    except subprocess.CalledProcessError:
         # Non-zero exit from `launchctl list <label>` means not loaded
-        print(f"[UNLOADED] {PLIST_LABEL}")
+        print(f"[UNLOADED] {label}")
 
-    plist_path = _get_plist_path()
     print(f"Plist path: {plist_path}")
     print(f"Plist exists: {plist_path.exists()}")
 
 
-def _print_load_instructions() -> None:
-    print(textwrap.dedent("""\
+def _print_load_instructions(service: str = "sidecar") -> None:
+    label = _label_for(service)
+    plist = _get_plist_path(service)
+    print(textwrap.dedent(f"""\
         To load the LaunchAgent (starts immediately and on every login):
-          launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.athena.token-sidecar.plist
+          launchctl bootstrap gui/$(id -u) {plist}
 
         Or more simply (load or reload if already installed):
-          launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
+          launchctl kickstart -kp gui/$(id -u)/{label}
 
         To unload and stop it without removing the plist:
-          uv run python setup_launchd.py uninstall
+          uv run python setup_launchd.py unload --service {service}
     """))
 
 
@@ -235,6 +366,14 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def _add_service_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--service",
+            choices=("sidecar", "dashboard"),
+            default="sidecar",
+            help="Which LaunchAgent to act on (default: sidecar).",
+        )
+
     install_parser = subparsers.add_parser(
         "install",
         help="Generate plist from config.yaml and write to ~/Library/LaunchAgents/",
@@ -244,21 +383,25 @@ def main() -> None:
         help="Path to config.yaml (default: project root)",
         default=None,
     )
+    _add_service_arg(install_parser)
 
-    subparsers.add_parser("unload", help="Stop the agent without removing the plist")
-    subparsers.add_parser("remove", help="Stop and delete the LaunchAgent")
-    subparsers.add_parser("status", help="Show loaded/unloaded state")
+    unload_parser = subparsers.add_parser("unload", help="Stop the agent without removing the plist")
+    _add_service_arg(unload_parser)
+    remove_parser = subparsers.add_parser("remove", help="Stop and delete the LaunchAgent")
+    _add_service_arg(remove_parser)
+    status_parser = subparsers.add_parser("status", help="Show loaded/unloaded state")
+    _add_service_arg(status_parser)
 
     args = parser.parse_args()
 
     if args.command == "install":
-        install(args.config)
+        install(args.config, args.service)
     elif args.command == "unload":
-        unload()
+        unload(args.service)
     elif args.command == "remove":
-        remove()
+        remove(args.service)
     elif args.command == "status":
-        status()
+        status(args.service)
 
 
 if __name__ == "__main__":

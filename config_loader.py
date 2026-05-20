@@ -29,6 +29,28 @@ REQUIRED_KEYS: list[str] = [
 
 
 @dataclass(frozen=True)
+class DashboardConfig:
+    """
+    Read-only dashboard service configuration (postgres box only).
+
+    Attributes:
+        enabled:           Gate for `setup_launchd.py install --service dashboard`.
+                           Does NOT stop `python dashboard.py` from serving when
+                           invoked directly.
+        listen_host:       Bind address (default "0.0.0.0").
+        listen_port:       TCP port (default 8080).
+        feed_initial_rows: Activity-feed bootstrap + trim length.
+        poll_interval_ms:  Client live-tick poll cadence in ms.
+    """
+
+    enabled: bool = False
+    listen_host: str = "0.0.0.0"
+    listen_port: int = 8080
+    feed_initial_rows: int = 50
+    poll_interval_ms: int = 2200
+
+
+@dataclass(frozen=True)
 class Config:
     """
     Immutable configuration object for the token-sidecar.
@@ -40,6 +62,7 @@ class Config:
                        (e.g. "http://localhost:1234").
         database_path: Expanded filesystem path to the SQLite DB file.
         log_level:     Logging level string (DEBUG, INFO, WARNING, ERROR).
+        dashboard:     Optional dashboard service settings (postgres box only).
         _raw:          Original dict for forward compatibility.
     """
 
@@ -48,6 +71,7 @@ class Config:
     upstream_url: str
     database_path: pathlib.Path
     log_level: str
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     _raw: dict = field(default_factory=dict)
 
     @classmethod
@@ -62,6 +86,7 @@ class Config:
         proxy = _get(d, "proxy") or {}
         database = _get(d, "database") or {}
         logging_cfg = _get(d, "logging") or {}
+        dashboard_cfg = _get(d, "dashboard") or {}
 
         # Check for missing required keys (not log_level which is optional)
         # Use explicit 'key not in dict' checks so that falsy values like 0 are accepted.
@@ -84,12 +109,21 @@ class Config:
         db_path_raw = database.get("path", "~/.token_sidecar/tokens.db")
         db_path = pathlib.Path(db_path_raw).expanduser()
 
+        dashboard = DashboardConfig(
+            enabled=bool(dashboard_cfg.get("enabled", False)),
+            listen_host=str(dashboard_cfg.get("listen_host", "0.0.0.0")),
+            listen_port=int(dashboard_cfg.get("listen_port", 8080)),
+            feed_initial_rows=int(dashboard_cfg.get("feed_initial_rows", 50)),
+            poll_interval_ms=int(dashboard_cfg.get("poll_interval_ms", 2200)),
+        )
+
         return cls(
             listen_host=str(proxy["listen_host"]),
             listen_port=int(proxy["listen_port"]),
             upstream_url=str(proxy["upstream_url"]),
             database_path=db_path,
             log_level=logging_cfg.get("level", "INFO").upper(),
+            dashboard=dashboard,
             _raw=dict(d),
         )
 

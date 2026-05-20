@@ -253,21 +253,46 @@ async def test_proxy_handles_upstream_error_gracefully(db_path, aiohttp_client):
 
 
 @pytest.mark.asyncio
-async def test_proxy_404_on_unknown_path(db_path, aiohttp_client):
-    """Any path not explicitly registered returns a JSON 404."""
+async def test_proxy_unknown_path_is_forwarded_to_upstream(db_path, aiohttp_client):
+    """
+    Paths the sidecar does not explicitly handle (e.g. /v1/models) are
+    transparently forwarded to LM Studio via the catch-all route. Responses
+    without a `usage` block do NOT produce a token_usage row.
+    """
+    # Mock upstream that serves GET /v1/models like LM Studio would.
+    upstream_app = web.Application()
+    upstream_body = {"object": "list", "data": [{"id": "fake-model", "object": "model"}]}
+
+    async def models_handler(_: web.Request) -> web.Response:
+        return web.Response(body=json.dumps(upstream_body).encode(),
+                            content_type="application/json")
+
+    upstream_app.router.add_get("/v1/models", models_handler)
+    upstream_client = await aiohttp_client(TestServer(upstream_app))
+    upstream_base = str(upstream_client.make_url("")).rstrip("/")
+
     config = {
         "proxy": {"listen_host": "localhost", "listen_port": 0,
-                  "upstream_url": "http://127.0.0.1:9999"},
+                  "upstream_url": upstream_base},
         "database": {"path": db_path},
         "logging": {"level": "CRITICAL"},
     }
     sidecar_app = create_app(Config.from_dict(config))
 
     async with TestClient(TestServer(sidecar_app)) as sc:
-        resp = await sc.get("/v1/models")   # unregistered path
-        assert resp.status == 404
-        body = await resp.json()
-        assert "error" in body
+        resp = await sc.get("/v1/models")
+        assert resp.status == 200
+        assert (await resp.json()) == upstream_body
+
+    # No token row should be written for /v1/models — only chat/completions
+    # and completions responses with `usage` are recorded.
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM token_usage")
+        assert cur.fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

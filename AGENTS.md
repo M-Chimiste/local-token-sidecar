@@ -61,6 +61,12 @@ commands, ports, schema, or launchd behavior.
 
 - `sidecar.py` builds the aiohttp app, forwards `/v1/chat/completions` and
   `/v1/completions`, handles `/health`, logs token usage, and returns JSON 404s.
+- `dashboard.py` is a separate aiohttp service for the postgres box. It is
+  read-only: serves the React dashboard UI from `dashboard_static/` and JSON
+  aggregates from the central Postgres via psycopg. It does NOT touch SQLite,
+  does NOT write to Postgres, and is independent of the sidecar process.
+- `dashboard_static/` holds the dashboard's HTML/CSS/JSX assets plus vendored
+  React + Babel-standalone (no CDN dependency at runtime).
 - `db.py` owns SQLite schema creation, inserts, and daily/hourly summary
   queries, plus the local outbox/cache used by central sync.
 - `postgres_store.py` owns central Postgres schema, batch inserts, and central
@@ -68,14 +74,15 @@ commands, ports, schema, or launchd behavior.
 - `central_sync.py` uploads queued SQLite outbox rows to Postgres and deletes
   local rows only after acknowledgement.
 - `config_loader.py` loads `config.yaml`, validates required keys, and exposes
-  the immutable `Config` dataclass. Resolution order: `--config` CLI arg →
-  `TOKEN_SIDECAR_CONFIG` env var → `<repo>/config.yaml`.
+  the immutable `Config` (+ `DashboardConfig`) dataclasses. Resolution order:
+  `--config` CLI arg → `TOKEN_SIDECAR_CONFIG` env var → `<repo>/config.yaml`.
 - `setup_launchd.py` installs, unloads, removes, and checks the macOS
-  LaunchAgent `com.athena.token-sidecar`.
+  LaunchAgents `com.athena.token-sidecar` (default) and
+  `com.athena.token-sidecar-dashboard` (via `--service dashboard`).
 - `queries/summary.py` is the Click CLI for daily, hourly, and all-time
   by-model summaries.
 - `tests/` contains unit and integration tests for DB, proxy, launchd, query
-  CLI, and end-to-end behavior.
+  CLI, dashboard API, and end-to-end behavior.
 - `config.yaml` is the default runtime config. Treat committed defaults as
   documentation of the local development setup.
 
@@ -104,9 +111,14 @@ commands, ports, schema, or launchd behavior.
   the LM Studio default unless a task explicitly changes ports.
 - `/health` should remain cheap and independent of LM Studio availability — it
   is the launchd respawn probe.
-- Do not rename the plist label (`com.athena.token-sidecar`), CLI commands,
-  config keys, or env var names without an explicit ask — they are baked into
-  installed user environments.
+- Do not rename the plist labels (`com.athena.token-sidecar`,
+  `com.athena.token-sidecar-dashboard`), CLI commands, config keys, or env
+  var names without an explicit ask — they are baked into installed user
+  environments.
+- The dashboard is strictly read-only. Adding write paths against the
+  central Postgres from `dashboard.py` is out of scope; if a writer is
+  needed, it belongs in `postgres_store.py` / `central_sync.py` and runs
+  in the sidecar's background loop, not in the dashboard service.
 
 ## Development Commands
 
@@ -163,6 +175,15 @@ uv run python setup_launchd.py install
 uv run python setup_launchd.py status
 uv run python setup_launchd.py unload
 uv run python setup_launchd.py remove
+```
+
+Run / manage the dashboard (postgres box only):
+
+```bash
+export TOKEN_SIDECAR_QUERY_DSN='postgresql://token_sidecar_reader:...@host:5432/token_sidecar'
+uv run python dashboard.py                                # binds 0.0.0.0:8080
+uv run python setup_launchd.py install --service dashboard
+uv run python setup_launchd.py status  --service dashboard
 ```
 
 ## Testing Expectations

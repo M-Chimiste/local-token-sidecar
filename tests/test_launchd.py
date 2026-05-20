@@ -25,7 +25,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from setup_launchd import (
     generate_plist_content,
+    generate_dashboard_plist_content,
     PLIST_LABEL,
+    DASHBOARD_PLIST_LABEL,
+    DASHBOARD_ENV_FILE,
 )
 
 
@@ -318,3 +321,87 @@ def test_status_prints_unloaded_when_not_found() -> None:
         output = f.getvalue()
 
     assert "[UNLOADED]" in output
+
+
+# -----------------------------------------------------------------------
+# Tests — dashboard plist
+# -----------------------------------------------------------------------
+
+@pytest.fixture
+def dashboard_script(project_dir: pathlib.Path) -> pathlib.Path:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    p = project_dir / "dashboard.py"
+    p.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    return p
+
+
+def test_dashboard_plist_uses_correct_label(
+    project_dir: pathlib.Path,
+    dashboard_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_dashboard_plist_content(
+        project_dir, dashboard_script,
+        tmp_path / "dashboard.log", tmp_path / "dashboard.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["Label"] == DASHBOARD_PLIST_LABEL
+    assert parsed["Label"] != PLIST_LABEL
+
+
+def test_dashboard_plist_uses_shell_wrapper_that_sources_env_conditionally(
+    project_dir: pathlib.Path,
+    dashboard_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_dashboard_plist_content(
+        project_dir, dashboard_script,
+        tmp_path / "dashboard.log", tmp_path / "dashboard.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    args = parsed["ProgramArguments"]
+    assert args[0] == "/bin/sh"
+    assert args[1] == "-c"
+    wrapper = args[2]
+    # Must be conditional (`if -f`), must always exec python (no `&&` short-circuit
+    # before exec), and must reference the env file path.
+    assert "if [ -f" in wrapper
+    assert str(DASHBOARD_ENV_FILE) in wrapper
+    assert "exec" in wrapper
+    # The bug we're guarding against: `. file && exec ...` crash-loops if file
+    # vanishes. The fragment that immediately precedes exec must be `; ` not `&&`.
+    fi_idx = wrapper.index("fi;")
+    exec_idx = wrapper.index("exec")
+    between = wrapper[fi_idx:exec_idx]
+    assert "&&" not in between
+
+
+def test_dashboard_plist_keep_alive_uses_successful_exit_false(
+    project_dir: pathlib.Path,
+    dashboard_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_dashboard_plist_content(
+        project_dir, dashboard_script,
+        tmp_path / "dashboard.log", tmp_path / "dashboard.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    # Same policy as the sidecar plist: respawn on crash, NOT on clean exit
+    # (so a clean exit on missing DSN doesn't trigger a crash loop).
+    assert parsed["KeepAlive"] == {"SuccessfulExit": False}
+    assert parsed["RunAtLoad"] is True
+
+
+def test_dashboard_plist_is_valid_xml(
+    project_dir: pathlib.Path,
+    dashboard_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_dashboard_plist_content(
+        project_dir, dashboard_script,
+        tmp_path / "dashboard.log", tmp_path / "dashboard.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["Label"] == DASHBOARD_PLIST_LABEL
+    assert str(tmp_path / "dashboard.log") == parsed["StandardOutPath"]
+    assert str(tmp_path / "dashboard.error.log") == parsed["StandardErrorPath"]
