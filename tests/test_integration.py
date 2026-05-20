@@ -43,6 +43,7 @@ import db as _db_module
 # Some models (qwen3.6-27b-mlx, gemma variants) can take 60–90s on cold load.
 # Use a generous per-request read timeout to avoid intermittent failures.
 DEFAULT_REQUEST_TIMEOUT = httpx.Timeout(30.0, read=120.0)
+_VALIDATED_TEST_MODELS: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,62 @@ def read_db_rows(db_path: str) -> list[dict]:
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
     return rows
+
+
+def get_test_models(min_count: int = 1) -> list[str]:
+    """Return available LM Studio model ids for live integration tests."""
+    global _VALIDATED_TEST_MODELS
+    if _VALIDATED_TEST_MODELS and len(_VALIDATED_TEST_MODELS) >= min_count:
+        return _VALIDATED_TEST_MODELS[:min_count]
+
+    explicit = os.environ.get("TOKEN_SIDECAR_TEST_MODELS")
+    if explicit:
+        models = [m.strip() for m in explicit.split(",") if m.strip()]
+        candidates = models
+    else:
+        upstream_url = os.environ.get("TOKEN_SIDECAR_UPSTREAM_URL", "http://localhost:1234")
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"{upstream_url}/v1/models")
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            pytest.skip(f"LM Studio models endpoint unavailable: {exc}")
+
+        candidates = [
+            item.get("id")
+            for item in data.get("data", [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and "embed" not in str(item.get("id")).lower()
+        ]
+
+    upstream_url = os.environ.get("TOKEN_SIDECAR_UPSTREAM_URL", "http://localhost:1234")
+    validated: list[str] = []
+    with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+        for model in candidates:
+            try:
+                resp = client.post(
+                    f"{upstream_url}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Reply ok."}],
+                        "max_tokens": 1,
+                    },
+                )
+            except Exception:
+                continue
+            if resp.status_code == 200:
+                validated.append(str(model))
+            if len(validated) >= min_count:
+                break
+
+    _VALIDATED_TEST_MODELS = validated
+    if len(validated) < min_count:
+        pytest.skip(
+            f"Need at least {min_count} chat-capable LM Studio model(s), got {validated}"
+        )
+    return validated[:min_count]
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +369,7 @@ def test_integration_single_chat_request(sidecar_env) -> None:
 def test_integration_multiple_requests_aggregation(sidecar_env) -> None:
     """Send 3 requests to different models; verify each creates a separate row."""
     port, db_path = sidecar_env
+    models = get_test_models(3)
 
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
         for model in _MOCK_MODELS:
@@ -432,6 +490,7 @@ def test_integration_by_model_sorted_descending(sidecar_env) -> None:
     import subprocess as _subprocess
 
     port, db_path = sidecar_env
+    models = get_test_models(2)
 
     with httpx.Client(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
         for model in _MOCK_MODELS[:2]:
@@ -480,6 +539,7 @@ def test_integration_lm_studio_offline_502(tmp_path: pathlib.Path) -> None:
     port = get_free_port()
     db_path = tmp_path / "tokens.db"
     config_path = tmp_path / "config.yaml"
+    model = get_test_models(1)[0]
 
     # Point to a port with nothing listening — simulates LM Studio offline
     bad_upstream = "http://127.0.0.1:65535"
@@ -543,6 +603,7 @@ def test_integration_lm_studio_recovery_after_offline(tmp_path: pathlib.Path, mo
     port = get_free_port()
     db_path = tmp_path / "tokens.db"
     config_path = tmp_path / "config.yaml"
+    model = get_test_models(1)[0]
 
     # Start pointing to a dead port
     bad_upstream = "http://127.0.0.1:65535"

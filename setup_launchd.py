@@ -63,6 +63,7 @@ def generate_plist_content(
     sidecar_script: pathlib.Path,
     log_out_path: pathlib.Path,
     log_err_path: pathlib.Path,
+    environment_variables: dict[str, str] | None = None,
 ) -> str:
     """
     Build and return the LaunchAgent plist XML as a string.
@@ -91,6 +92,8 @@ def generate_plist_content(
         "StandardErrorPath": str(log_err_path),
         "WorkingDirectory": str(project_dir),
     }
+    if environment_variables:
+        plist_data["EnvironmentVariables"] = environment_variables
 
     with open(plist_data["StandardOutPath"], "a", encoding="utf-8") as fh:
         # Ensure log directory exists before launchd tries to write
@@ -238,6 +241,7 @@ def install(config_path: Optional[str] = None, service: str = "sidecar") -> None
 
     # Load config to get database path (for log directory)
     from config_loader import load_config
+    effective_config_path = config_path or os.environ.get("TOKEN_SIDECAR_CONFIG")
     cfg = load_config(config_path)
 
     # Log paths under ~/.token_sidecar/
@@ -259,18 +263,34 @@ def install(config_path: Optional[str] = None, service: str = "sidecar") -> None
             log_err_path=log_dir / "dashboard.error.log",
         )
     else:
+        config_file = (
+            pathlib.Path(effective_config_path).expanduser().resolve()
+            if effective_config_path
+            else PROJECT_ROOT / "config.yaml"
+        )
+        environment_variables = {
+            "TOKEN_SIDECAR_CONFIG": str(config_file),
+        }
+        if cfg.central.enabled and cfg.central.dsn:
+            environment_variables[cfg.central.dsn_env] = cfg.central.dsn
+
         plist_content = generate_plist_content(
             project_dir=PROJECT_ROOT,
             sidecar_script=PROJECT_ROOT / "sidecar.py",
             log_out_path=log_dir / "sidecar.log",
             log_err_path=log_dir / "sidecar.error.log",
+            environment_variables=environment_variables,
         )
 
     plist_path = _get_plist_path(service)
 
     with open(plist_path, "w", encoding="utf-8") as fh:
         fh.write(plist_content)
-    os.chmod(plist_path, 0o644)
+    # If the sidecar plist embeds the central DSN, keep it owner-readable only.
+    if service != "dashboard" and cfg.central.enabled:
+        os.chmod(plist_path, 0o600)
+    else:
+        os.chmod(plist_path, 0o644)
 
     print(f"Plist written to:\n  {plist_path}\n")
     _print_load_instructions(service)

@@ -149,6 +149,29 @@ def test_working_directory_set(
     assert str(project_dir.resolve()) == parsed.get("WorkingDirectory", "")
 
 
+def test_environment_variables_can_be_embedded(
+    project_dir: pathlib.Path,
+    sidecar_script: pathlib.Path,
+    log_out_path: pathlib.Path,
+    log_err_path: pathlib.Path,
+) -> None:
+    """Central sync DSNs can be passed to launchd via EnvironmentVariables."""
+    xml = generate_plist_content(
+        project_dir,
+        sidecar_script,
+        log_out_path,
+        log_err_path,
+        environment_variables={
+            "TOKEN_SIDECAR_CONFIG": "/tmp/config.yaml",
+            "TOKEN_SIDECAR_POSTGRES_DSN": "postgresql://example",
+        },
+    )
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    env = parsed["EnvironmentVariables"]
+    assert env["TOKEN_SIDECAR_CONFIG"] == "/tmp/config.yaml"
+    assert env["TOKEN_SIDECAR_POSTGRES_DSN"] == "postgresql://example"
+
+
 def test_xml_is_valid_and_parseable(
     project_dir: pathlib.Path,
     sidecar_script: pathlib.Path,

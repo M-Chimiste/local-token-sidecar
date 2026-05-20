@@ -16,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import db as _db
+import sidecar
 from sidecar import create_app
 
 
@@ -227,6 +228,47 @@ async def test_proxy_extracts_usage_and_logs_to_db(db_path, aiohttp_client, upst
 
 
 @pytest.mark.asyncio
+async def test_proxy_logs_outbox_metadata(db_path, aiohttp_client, upstream_chat_server):
+    """A logged usage row includes node, endpoint, status, and event id."""
+    mock_client = await aiohttp_client(upstream_chat_server)
+    upstream_base = str(mock_client.make_url("")).rstrip("/")
+
+    config = {
+        "node": {"id": "athena"},
+        "proxy": {"listen_host": "localhost", "listen_port": 0,
+                  "upstream_url": upstream_base},
+        "database": {"path": db_path},
+        "logging": {"level": "CRITICAL"},
+    }
+    sidecar_app = create_app(Config.from_dict(config))
+
+    async with TestClient(TestServer(sidecar_app)) as sc:
+        resp = await sc.post(
+            "/v1/chat/completions",
+            json={"model": "my-test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status == 200
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT event_id, node_id, endpoint, status_code "
+            "FROM token_usage ORDER BY id",
+        )
+        rows = list(cur.fetchall())
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    event_id, node_id, endpoint, status_code = rows[0]
+    assert event_id
+    assert node_id == "athena"
+    assert endpoint == "/v1/chat/completions"
+    assert status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_proxy_handles_upstream_error_gracefully(db_path, aiohttp_client):
     """
     When the upstream is unreachable (port 1 has nothing listening),
@@ -259,7 +301,6 @@ async def test_proxy_unknown_path_is_forwarded_to_upstream(db_path, aiohttp_clie
     transparently forwarded to LM Studio via the catch-all route. Responses
     without a `usage` block do NOT produce a token_usage row.
     """
-    # Mock upstream that serves GET /v1/models like LM Studio would.
     upstream_app = web.Application()
     upstream_body = {"object": "list", "data": [{"id": "fake-model", "object": "model"}]}
 
@@ -284,8 +325,6 @@ async def test_proxy_unknown_path_is_forwarded_to_upstream(db_path, aiohttp_clie
         assert resp.status == 200
         assert (await resp.json()) == upstream_body
 
-    # No token row should be written for /v1/models — only chat/completions
-    # and completions responses with `usage` are recorded.
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
@@ -293,6 +332,36 @@ async def test_proxy_unknown_path_is_forwarded_to_upstream(db_path, aiohttp_clie
         assert cur.fetchone()[0] == 0
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_proxy_returns_upstream_response_when_local_log_fails(
+    db_path, aiohttp_client, upstream_chat_server, monkeypatch
+):
+    """SQLite/outbox failures must not change the response returned to clients."""
+    mock_client = await aiohttp_client(upstream_chat_server)
+    upstream_base = str(mock_client.make_url("")).rstrip("/")
+
+    def fail_log(*args, **kwargs):
+        raise sqlite3.OperationalError("disk is angry")
+
+    monkeypatch.setattr(sidecar._db, "log_token_usage", fail_log)
+
+    config = {
+        "proxy": {"listen_host": "localhost", "listen_port": 0,
+                  "upstream_url": upstream_base},
+        "database": {"path": db_path},
+        "logging": {"level": "CRITICAL"},
+    }
+    sidecar_app = create_app(Config.from_dict(config))
+
+    async with TestClient(TestServer(sidecar_app)) as sc:
+        resp = await sc.post(
+            "/v1/chat/completions",
+            json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert resp.status == 200
+        assert await resp.json() == CHAT_UPSTREAM_BODY
 
 
 @pytest.mark.asyncio
@@ -358,8 +427,9 @@ def test_load_config_raises_on_missing_required_keys(tmp_path):
     assert "proxy.listen_host" in msg
 
 
-def test_load_config_returns_valid_Config_object():
+def test_load_config_returns_valid_Config_object(monkeypatch):
     """Default config.yaml produces a properly typed Config object."""
+    monkeypatch.setenv("TOKEN_SIDECAR_POSTGRES_DSN", "postgresql://example")
     cfg = load_config()
     assert isinstance(cfg, Config)
     assert isinstance(cfg.listen_port, int)
@@ -367,10 +437,68 @@ def test_load_config_returns_valid_Config_object():
     assert str(cfg.database_path).endswith(".db")
 
 
-def test_config_log_level_defaults_to_info():
+def test_config_log_level_defaults_to_info(monkeypatch):
     """log_level is optional and defaults to INFO when absent from config."""
+    monkeypatch.setenv("TOKEN_SIDECAR_POSTGRES_DSN", "postgresql://example")
     cfg = load_config()
     assert cfg.log_level == "INFO"
+
+
+def test_config_central_defaults_disabled():
+    """Central reporting is opt-in and does not require a DSN by default."""
+    cfg = Config.from_dict({
+        "proxy": {
+            "listen_host": "localhost",
+            "listen_port": 0,
+            "upstream_url": "http://127.0.0.1:1234",
+        },
+        "database": {"path": "/tmp/tokens.db"},
+    })
+    assert cfg.node_id == "local"
+    assert cfg.central.enabled is False
+    assert cfg.central.dsn is None
+
+
+def test_config_central_requires_node_id(monkeypatch):
+    """A stable node id is required when central Postgres sync is enabled."""
+    monkeypatch.setenv("TOKEN_SIDECAR_POSTGRES_DSN", "postgresql://example")
+    with pytest.raises(ValueError, match="node.id"):
+        Config.from_dict({
+            "proxy": {
+                "listen_host": "localhost",
+                "listen_port": 0,
+                "upstream_url": "http://127.0.0.1:1234",
+            },
+            "database": {
+                "path": "/tmp/tokens.db",
+                "central": {"enabled": True},
+            },
+        })
+
+
+def test_config_central_reads_dsn_from_env(monkeypatch):
+    """Central sync resolves the configured DSN environment variable."""
+    monkeypatch.setenv("TOKEN_SIDECAR_POSTGRES_DSN", "postgresql://example")
+    cfg = Config.from_dict({
+        "node": {"id": "athena"},
+        "proxy": {
+            "listen_host": "localhost",
+            "listen_port": 0,
+            "upstream_url": "http://127.0.0.1:1234",
+        },
+        "database": {
+            "path": "/tmp/tokens.db",
+            "central": {
+                "enabled": True,
+                "flush_interval_seconds": 1,
+                "batch_size": 5,
+            },
+        },
+    })
+    assert cfg.node_id == "athena"
+    assert cfg.central.enabled is True
+    assert cfg.central.dsn == "postgresql://example"
+    assert cfg.central.batch_size == 5
 
 
 @pytest.mark.asyncio

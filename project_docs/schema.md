@@ -1,12 +1,14 @@
 # Token Sidecar — Database Schema
 
-**Default location:** `~/.token_sidecar/tokens.db`
+**Default local location:** `~/.token_sidecar/tokens.db`
 
 ---
 
 ## Overview
 
-SQLite database storing one row per LLM API call, capturing token usage extracted from LM Studio's OpenAI-compatible responses. Timestamps are stored in UTC.
+SQLite stores the local hot-path outbox/cache. When central Postgres sync is disabled, it behaves like the historical local reporting database. When central sync is enabled, rows are uploaded to Postgres in the background and deleted locally after acknowledgement.
+
+Postgres stores the centralized reporting copy across machines. Timestamps are stored and queried in UTC.
 
 ---
 
@@ -16,22 +18,65 @@ Primary table. One row is inserted for every `/v1/chat/completions` or `/v1/comp
 
 | Column | Type | Nullable | Description |
 |--------|------|:--------:|-------------|
-| `id` | INTEGER | No | Auto-increment primary key |
+| `id` | INTEGER | No | Local auto-increment primary key |
+| `event_id` | TEXT | Yes | Globally unique event id used for idempotent Postgres uploads |
 | `timestamp` | TEXT | No | ISO 8601 UTC datetime, e.g. `2026-05-17T14:32:01.123456` |
+| `node_id` | TEXT | Yes | Stable machine name, e.g. `athena` or `metis` |
 | `model` | TEXT | No | Model name as sent in the request body — stored as-is, not normalised |
 | `prompt_tokens` | INTEGER | No | Input token count from LM Studio's `usage.prompt_tokens` (default 0) |
 | `completion_tokens` | INTEGER | No | Output token count from LM Studio's `usage.completion_tokens` (default 0) |
 | `total_tokens` | INTEGER | No | Sum of prompt + completion tokens |
 | `response_ms` | REAL | No | Elapsed milliseconds for the upstream call |
+| `endpoint` | TEXT | Yes | Proxied endpoint that produced the usage object |
+| `status_code` | INTEGER | Yes | Upstream HTTP status code |
+| `sync_attempts` | INTEGER | No | Failed central upload attempts for this local row |
+| `last_attempt_at` | TEXT | Yes | UTC timestamp of the last failed central upload attempt |
+| `last_sync_error` | TEXT | Yes | Last central upload error, truncated for local diagnostics |
 
 ### Indexes
 
 ```sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_event_id
+    ON token_usage(event_id)
+    WHERE event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_usage_model     ON token_usage(model);
+CREATE INDEX IF NOT EXISTS idx_token_usage_node      ON token_usage(node_id);
 ```
 
 These indexes exist to speed up the daily and hourly summary queries.
+
+Existing SQLite databases are migrated in place on startup. Rows from older
+schema versions receive generated `event_id` values, the configured `node_id`,
+`/v1/unknown` as endpoint, and `200` as status code.
+
+---
+
+## Central Postgres Table
+
+Postgres uses the same logical fact table, keyed by `event_id` for idempotent
+batch uploads:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `event_id` | TEXT PRIMARY KEY | Unique event id generated on the sidecar |
+| `timestamp` | TIMESTAMPTZ | UTC event timestamp |
+| `node_id` | TEXT | Stable machine name |
+| `model` | TEXT | Request model name as sent by the client |
+| `prompt_tokens` | INTEGER | Prompt token count |
+| `completion_tokens` | INTEGER | Completion token count |
+| `total_tokens` | INTEGER | Total token count |
+| `response_ms` | DOUBLE PRECISION | Upstream response time in ms |
+| `endpoint` | TEXT | Proxied endpoint |
+| `status_code` | INTEGER | Upstream HTTP status code |
+| `ingested_at` | TIMESTAMPTZ | Postgres insertion timestamp |
+
+Dashboard views created by `scripts/init_postgres.py`:
+
+- `token_usage_daily`
+- `token_usage_hourly`
+- `token_usage_by_model`
+- `token_usage_by_node`
 
 ---
 
@@ -102,15 +147,26 @@ GROUP BY hour_utc, model
 ORDER BY hour_utc, tokens_total DESC;
 ```
 
+### Central Postgres daily totals by node
+
+```sql
+SELECT *
+FROM token_usage_daily
+WHERE date_utc = DATE '2026-05-17'
+  AND node_id = 'athena'
+ORDER BY total_tokens DESC;
+```
+
 ---
 
 ## Notes
 
-- **Timestamps are UTC.** All query helpers (`get_daily_summary`, `get_hourly_summary`) operate in UTC.
+- **Timestamps are UTC.** All SQLite and Postgres query helpers operate in UTC.
 - **`model` is not validated or normalised** — whatever string the client sends as the `model` field in the request body is stored verbatim. Different clients may use different names for the same model.
 - **`response_ms` may be 0** if the upstream call fails before timing completes (e.g., immediate 502 Bad Gateway).
-- **Schema migrations:** The sidecar uses `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`, so running it against an existing database is safe. New indexes are added automatically on startup.
-- **Database file permissions:** Created with `0o600` (user read/write only) under the `~/.token_sidecar/` directory which itself is created with `0o700`.
+- **Schema migrations:** The sidecar uses additive SQLite migrations, so running it against an existing local database is safe. New columns and indexes are added automatically on startup.
+- **Central sync:** Postgres is never contacted in the request path. Background sync inserts with `ON CONFLICT DO NOTHING`, then deletes acknowledged local rows.
+- **Database directory:** Install tooling creates `~/.token_sidecar/` with mode `0o700`.
 
 ---
 
@@ -120,17 +176,20 @@ ORDER BY hour_utc, tokens_total DESC;
 ┌─────────────────── token_usage ────────────────────┐
 │                                                        │
 │  id                INTEGER PRIMARY KEY AUTOINCREMENT   │
+│  event_id          TEXT                                │
 │  timestamp         TEXT    NOT NULL                   │
+│  node_id           TEXT                                │
 │  model             TEXT    NOT NULL                   │
 │  prompt_tokens     INTEGER NOT NULL DEFAULT 0          │
 │  completion_tokens INTEGER NOT NULL DEFAULT 0          │
 │  total_tokens      INTEGER NOT NULL DEFAULT 0          │
 │  response_ms       REAL    NOT NULL                   │
+│  endpoint/status + sync retry metadata                 │
 │                                                        │
 └───────────────────────────────────────────────────────┘
          │                                           ▲
-         │ idx_token_usage_timestamp (timestamp)     │
-         │ idx_token_usage_model (model)             │
+         │ idx_token_usage_event_id (event_id)       │
+         │ idx_token_usage_timestamp/model/node      │
          ▼                                           │
   Speed up daily / hourly aggregation queries        │
 ```

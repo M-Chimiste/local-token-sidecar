@@ -20,7 +20,7 @@ import pytest_asyncio
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import dashboard
-from config_loader import Config, DashboardConfig
+from config_loader import Config, DashboardConfig, CentralDatabaseConfig
 
 pytestmark = pytest.mark.asyncio
 
@@ -259,6 +259,8 @@ def _cfg() -> Config:
         upstream_url="http://localhost:1234",
         database_path=Path("/tmp/test-token-sidecar.db"),
         log_level="INFO",
+        node_id="test",
+        central=CentralDatabaseConfig(),
         dashboard=DashboardConfig(),
         _raw={},
     )

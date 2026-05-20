@@ -69,20 +69,21 @@ uv sync --quiet
 # 3. Create data directory + init DB schema
 # ---------------------------------------------------------------------------
 DATA_DIR="$HOME/.token_sidecar"
-DB_PATH_EXPANDED=$(python3 -c "import os; print(os.path.expanduser('~/.token_sidecar/tokens.db'))")
 
 info "Creating data directory: $DATA_DIR"
 mkdir -p "$DATA_DIR" && chmod 700 "$DATA_DIR"
 
 # Use the project's db.py to init schema
-info "Initializing database at $DB_PATH_EXPANDED..."
+info "Initializing database from config.yaml..."
 uv run python -c "
 import sys, os
 sys.path.insert(0, '$SCRIPT_DIR')
+from config_loader import load_config
 from db import init_db
-db_path = os.path.expanduser('$DB_PATH_EXPANDED')
+cfg = load_config('$CONFIG_FILE')
+db_path = os.path.expanduser(str(cfg.database_path))
 os.makedirs(os.path.dirname(db_path), exist_ok=True)
-init_db(db_path)
+init_db(db_path, node_id=cfg.node_id)
 print(f'DB schema ready at {db_path}')
 "
 
@@ -90,9 +91,6 @@ print(f'DB schema ready at {db_path}')
 # 4. Generate LaunchAgent plist from config.yaml
 # ---------------------------------------------------------------------------
 info "Generating LaunchAgent plist..."
-
-# Use the venv's Python (has all project deps) for the LaunchAgent
-PYEXECUTABLE="$SCRIPT_DIR/.venv/bin/python"
 
 # Extract values from config.yaml via Python (simple one-liner)
 IFS=" " read -r LISTEN_PORT UPSTREAM_URL DB_PATH <<< "$(cd "$SCRIPT_DIR" && uv run python -c "
@@ -102,54 +100,8 @@ with open('$CONFIG_FILE') as f:
 print(cfg['proxy']['listen_port'], cfg['proxy']['upstream_url'], os.path.expanduser(cfg['database']['path']))
 ")"
 
-# Build plist XML
-PLIST_CONTENT="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-    <key>Label</key>
-    <string>$LABEL</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>$PYEXECUTABLE</string>
-        <string>$SCRIPT_DIR/sidecar.py</string>
-    </array>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>TOKEN_SIDECAR_CONFIG</key>
-        <string>$CONFIG_FILE</string>
-    </dict>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>$DATA_DIR/sidecar.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>$DATA_DIR/sidecar.error.log</string>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-</dict>
-</plist>"
-
-info "Writing plist to $PLIST_DEST"
 mkdir -p "$(dirname "$PLIST_DEST")"
-
-if [[ -f "$PLIST_DEST" ]]; then
-  warn "Plist already exists. Overwriting."
-fi
-
-printf '%s' "$PLIST_CONTENT" > "$PLIST_DEST"
+uv run python setup_launchd.py install --config "$CONFIG_FILE"
 plutil -lint "$PLIST_DEST" || fail "plist validation failed"
 
 # ---------------------------------------------------------------------------
@@ -170,7 +122,7 @@ fi
 info ""
 info "Installation complete!"
 info ""
-info "Database: $DB_PATH_EXPANDED"
+info "Database: $DB_PATH"
 info "Logs:     $DATA_DIR/sidecar.log, $DATA_DIR/sidecar.error.log"
 info ""
 info "To start the sidecar immediately (without reboot):"

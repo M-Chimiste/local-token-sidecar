@@ -95,6 +95,8 @@ def test_init_db_creates_tables(mem_db):
             "id", "timestamp", "model",
             "prompt_tokens", "completion_tokens",
             "total_tokens", "response_ms",
+            "event_id", "node_id", "endpoint", "status_code",
+            "sync_attempts", "last_attempt_at", "last_sync_error",
         }
         assert cols == expected_cols
     finally:
@@ -148,6 +150,146 @@ def test_log_token_usage_roundtrip(mem_db):
     assert row["completion_tokens"] == 22
     assert row["total_tokens"] == 55
     assert row["response_ms"] == 77.7
+    assert row["event_id"]
+    assert row["node_id"] == "local"
+    assert row["endpoint"] == "/v1/chat/completions"
+    assert row["status_code"] == 200
+
+
+def test_log_token_usage_accepts_outbox_metadata(mem_db):
+    """Central sync metadata is stored with each local outbox row."""
+    rid = _db.log_token_usage(
+        mem_db,
+        model="central-model",
+        prompt_tokens=3,
+        completion_tokens=4,
+        total_tokens=7,
+        response_ms=88.0,
+        node_id="athena",
+        endpoint="/v1/completions",
+        status_code=201,
+        event_id="event-123",
+        timestamp="2026-05-17T10:00:00+00:00",
+    )
+
+    conn = sqlite3.connect(mem_db)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT event_id, timestamp, node_id, endpoint, status_code "
+            "FROM token_usage WHERE id = ?",
+            (rid,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    assert row == (
+        "event-123",
+        "2026-05-17T10:00:00+00:00",
+        "athena",
+        "/v1/completions",
+        201,
+    )
+
+
+def test_init_db_migrates_legacy_schema(tmp_path):
+    """Existing SQLite DBs get outbox columns and backfilled event/node fields."""
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    try:
+        conn.execute(
+            """CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                response_ms REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO token_usage
+               (timestamp, model, prompt_tokens, completion_tokens,
+                total_tokens, response_ms)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("2026-05-17T10:00:00+00:00", "legacy-model", 1, 2, 3, 4.0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _db.init_db(str(legacy), node_id="metis")
+
+    conn = sqlite3.connect(legacy)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM token_usage").fetchone()
+    finally:
+        conn.close()
+
+    assert row["model"] == "legacy-model"
+    assert row["event_id"]
+    assert row["node_id"] == "metis"
+    assert row["endpoint"] == "/v1/unknown"
+    assert row["status_code"] == 200
+    assert row["sync_attempts"] == 0
+
+
+def test_outbox_select_and_ack_delete(mem_db):
+    """Queued rows are returned for upload and deleted after acknowledgement."""
+    _db.log_token_usage(
+        mem_db,
+        model="queued-model",
+        prompt_tokens=1,
+        completion_tokens=2,
+        total_tokens=3,
+        response_ms=10.0,
+        node_id="athena",
+        event_id="queued-1",
+    )
+
+    queued = _db.get_unsynced_token_usage(mem_db, limit=10, node_id="athena")
+    assert [row["event_id"] for row in queued] == ["queued-1"]
+    assert queued[0]["node_id"] == "athena"
+
+    deleted = _db.mark_token_usage_synced(mem_db, ["queued-1"])
+    assert deleted == 1
+    assert _db.get_unsynced_token_usage(mem_db, limit=10, node_id="athena") == []
+
+
+def test_outbox_failed_sync_records_retry_metadata(mem_db):
+    """Failed central uploads increment attempts and keep rows queued."""
+    _db.log_token_usage(
+        mem_db,
+        model="queued-model",
+        prompt_tokens=1,
+        completion_tokens=2,
+        total_tokens=3,
+        response_ms=10.0,
+        node_id="athena",
+        event_id="queued-2",
+    )
+
+    updated = _db.mark_token_usage_sync_failed(mem_db, ["queued-2"], "boom")
+    assert updated == 1
+
+    conn = sqlite3.connect(mem_db)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT sync_attempts, last_attempt_at, last_sync_error "
+            "FROM token_usage WHERE event_id = ?",
+            ("queued-2",),
+        )
+        attempts, last_attempt, error = cur.fetchone()
+    finally:
+        conn.close()
+
+    assert attempts == 1
+    assert last_attempt
+    assert error == "boom"
 
 
 # ---------------------------------------------------------------------------

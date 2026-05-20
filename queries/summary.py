@@ -3,12 +3,14 @@
 Token sidecar query CLI.
 
 Usage:
-    python -m queries.summary daily [--date YYYY-MM-DD] [--model NAME] [--format json|table]
-    python -m queries.summary hourly --date YYYY-MM-DD [--format json|table]
-    python -m queries.summary by-model [--format json|table]
+    python -m queries.summary daily [--date YYYY-MM-DD] [--model NAME] [--format json|table] [--backend auto|sqlite|postgres] [--node NODE]
+    python -m queries.summary hourly --date YYYY-MM-DD [--format json|table] [--backend auto|sqlite|postgres] [--node NODE]
+    python -m queries.summary by-model [--format json|table] [--backend auto|sqlite|postgres] [--node NODE]
 
 Environment:
-    TOKEN_SIDECAR_DB  Override the database path (default: from config.yaml)
+    TOKEN_SIDECAR_DB            Override local SQLite path
+    TOKEN_SIDECAR_QUERY_DSN     Preferred Postgres read/reporting DSN
+    TOKEN_SIDECAR_POSTGRES_DSN  Fallback Postgres DSN
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 import db as _db
+import postgres_store
 from config_loader import load_config
 
 
@@ -50,6 +53,31 @@ def resolve_db_path() -> str:
     # load_config reads from project root by default; pass None for --config override
     cfg = load_config()
     return str(cfg.database_path)
+
+
+def resolve_postgres_dsn() -> str | None:
+    """Return the reporting Postgres DSN, if configured."""
+    return (
+        os.environ.get("TOKEN_SIDECAR_QUERY_DSN")
+        or os.environ.get("TOKEN_SIDECAR_POSTGRES_DSN")
+    )
+
+
+def resolve_backend(requested: str) -> tuple[str, str | None]:
+    """Resolve auto/sqlite/postgres into an active backend and optional DSN."""
+    dsn = resolve_postgres_dsn()
+    if requested == "sqlite":
+        return "sqlite", None
+    if requested == "postgres":
+        if not dsn:
+            raise click.ClickException(
+                "Postgres backend requested, but neither TOKEN_SIDECAR_QUERY_DSN "
+                "nor TOKEN_SIDECAR_POSTGRES_DSN is set."
+            )
+        return "postgres", dsn
+    if dsn:
+        return "postgres", dsn
+    return "sqlite", None
 
 
 def resolve_format(requested: str | None) -> str:
@@ -77,6 +105,21 @@ def parse_date(value: str | None) -> str | None:
 
 def print_json(data) -> None:
     json.dump(data, sys.stdout, indent=2)
+
+
+def utc_today() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def should_fallback_to_sqlite(requested_backend: str, exc: Exception) -> bool:
+    """Return True for auto-mode Postgres failures after warning the user."""
+    if requested_backend != "auto":
+        return False
+    click.echo(
+        f"Postgres query failed; falling back to SQLite: {exc}",
+        err=True,
+    )
+    return True
 
 
 # -----------------------------------------------------------------------
@@ -123,15 +166,57 @@ def cli() -> None:
     default=None,
     help='Output format: "table" (default in terminal) or "json" (default when piped).',
 )
-def daily(date_str: str | None, model_name: str | None, output_format: str | None) -> None:
+@click.option(
+    "--backend",
+    "backend",
+    type=click.Choice(["auto", "sqlite", "postgres"]),
+    default="auto",
+    show_default=True,
+    help="Read from local SQLite or central Postgres.",
+)
+@click.option(
+    "--node",
+    "node_id",
+    default=None,
+    help="Filter central/local results to one node_id.",
+)
+def daily(
+    date_str: str | None,
+    model_name: str | None,
+    output_format: str | None,
+    backend: str,
+    node_id: str | None,
+) -> None:
     """Daily token usage summary grouped by model.
 
     Shows one row per model with total requests and token counts for the day.
     """
     date = parse_date(date_str)
     fmt = resolve_format(output_format)
+    backend_name, dsn = resolve_backend(backend)
 
-    rows = _db.get_daily_summary(resolve_db_path(), date=date)
+    target_date = date or utc_today()
+    if backend_name == "postgres":
+        try:
+            rows = postgres_store.get_daily_summary(
+                dsn or "",
+                date=target_date,
+                node_id=node_id,
+            )
+        except Exception as exc:
+            if not should_fallback_to_sqlite(backend, exc):
+                raise click.ClickException(f"Postgres query failed: {exc}") from exc
+            rows = _db.get_daily_summary(
+                resolve_db_path(),
+                date=date,
+                node_id=node_id,
+            )
+    else:
+        rows = _db.get_daily_summary(
+            resolve_db_path(),
+            date=date,
+            node_id=node_id,
+        )
     if model_name:
         rows = [r for r in rows if r["model"] == model_name]
 
@@ -143,7 +228,6 @@ def daily(date_str: str | None, model_name: str | None, output_format: str | Non
         sys.exit(0)
 
     # Normalise to list-of-dict regardless of what db layer returned
-    target_date = date or datetime.date.today().isoformat()
     rows = [_normalise_row(r, row_date=target_date) for r in rows]
 
     if fmt == "json":
@@ -189,15 +273,55 @@ def daily(date_str: str | None, model_name: str | None, output_format: str | Non
     default=None,
     help='Output format: "table" (default in terminal) or "json" (default when piped).',
 )
-def hourly(date_str: str, output_format: str | None) -> None:
+@click.option(
+    "--backend",
+    "backend",
+    type=click.Choice(["auto", "sqlite", "postgres"]),
+    default="auto",
+    show_default=True,
+    help="Read from local SQLite or central Postgres.",
+)
+@click.option(
+    "--node",
+    "node_id",
+    default=None,
+    help="Filter central/local results to one node_id.",
+)
+def hourly(
+    date_str: str,
+    output_format: str | None,
+    backend: str,
+    node_id: str | None,
+) -> None:
     """Hourly breakdown of token usage for a specific date.
 
     Shows one row per (model, hour) pair, sorted by hour then tokens descending.
     """
     date = parse_date(date_str)  # validates format; raises click.BadParameter if bad
     fmt = resolve_format(output_format)
+    backend_name, dsn = resolve_backend(backend)
 
-    rows = _db.get_hourly_summary(resolve_db_path(), date=date)
+    if backend_name == "postgres":
+        try:
+            rows = postgres_store.get_hourly_summary(
+                dsn or "",
+                date=date or utc_today(),
+                node_id=node_id,
+            )
+        except Exception as exc:
+            if not should_fallback_to_sqlite(backend, exc):
+                raise click.ClickException(f"Postgres query failed: {exc}") from exc
+            rows = _db.get_hourly_summary(
+                resolve_db_path(),
+                date=date,
+                node_id=node_id,
+            )
+    else:
+        rows = _db.get_hourly_summary(
+            resolve_db_path(),
+            date=date,
+            node_id=node_id,
+        )
     if not rows:
         click.echo(f"No data for {date}.", err=True)
         sys.exit(0)
@@ -241,34 +365,39 @@ def hourly(date_str: str, output_format: str | None) -> None:
     default=None,
     help='Output format: "table" (default in terminal) or "json" (default when piped).',
 )
-def by_model(output_format: str | None) -> None:
+@click.option(
+    "--backend",
+    "backend",
+    type=click.Choice(["auto", "sqlite", "postgres"]),
+    default="auto",
+    show_default=True,
+    help="Read from local SQLite or central Postgres.",
+)
+@click.option(
+    "--node",
+    "node_id",
+    default=None,
+    help="Filter central/local results to one node_id.",
+)
+def by_model(output_format: str | None, backend: str, node_id: str | None) -> None:
     """All-time totals grouped by model name.
 
     Sorts models descending by total tokens so the heaviest users appear first.
     """
     fmt = resolve_format(output_format)
+    backend_name, dsn = resolve_backend(backend)
 
-    # Aggregate all rows across all dates, grouping by model
-    db_path = resolve_db_path()
+    if backend_name == "postgres":
+        try:
+            raw_rows = postgres_store.get_by_model_summary(dsn or "", node_id=node_id)
+        except Exception as exc:
+            if not should_fallback_to_sqlite(backend, exc):
+                raise click.ClickException(f"Postgres query failed: {exc}") from exc
+            raw_rows = _db.get_by_model_summary(resolve_db_path(), node_id=node_id)
+    else:
+        raw_rows = _db.get_by_model_summary(resolve_db_path(), node_id=node_id)
 
-    conn = _db.sqlite3.connect(str(Path(db_path).expanduser().resolve()))
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT
-                    model,
-                    COUNT(*)         AS request_count,
-                    SUM(prompt_tokens)     AS total_prompt_tokens,
-                    SUM(completion_tokens) AS total_completion_tokens,
-                    SUM(total_tokens)      AS total_tokens
-                 FROM token_usage
-             GROUP BY model
-             ORDER BY total_tokens DESC"""
-        )
-        cols = [desc[0] for desc in cur.description]
-        rows = [_normalise_row(dict(zip(cols, row))) for row in cur.fetchall()]
-    finally:
-        conn.close()
+    rows = [_normalise_row(row) for row in raw_rows]
 
     if not rows:
         click.echo("No data in database yet.", err=True)
