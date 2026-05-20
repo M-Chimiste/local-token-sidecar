@@ -76,6 +76,26 @@ def make_upstream_server(path: str, response_body: dict) -> TestServer:
     return TestServer(app)
 
 
+def make_sse_upstream_server(path: str, events: list[bytes]) -> TestServer:
+    """Build a mock upstream that streams raw SSE chunks for `path`."""
+    app = web.Application()
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        resp = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream"},
+        )
+        await resp.prepare(request)
+        for event in events:
+            await resp.write(event)
+        await resp.write_eof()
+        return resp
+
+    app.router.add_post(path, handler)
+    return TestServer(app)
+
+
 @pytest.fixture
 def upstream_chat_server():
     """Mock LM Studio server for /v1/chat/completions."""
@@ -362,6 +382,104 @@ async def test_proxy_returns_upstream_response_when_local_log_fails(
         )
         assert resp.status == 200
         assert await resp.json() == CHAT_UPSTREAM_BODY
+
+
+@pytest.mark.asyncio
+async def test_proxy_logs_sse_stream_usage(db_path, aiohttp_client):
+    """
+    A streamed chat completion that includes a `usage` chunk (per
+    `stream_options.include_usage: true`) is forwarded byte-for-byte AND a
+    token_usage row is written with the counts from that chunk.
+    """
+    usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    events = [
+        b'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}\n\n',
+        b'data: {"id":"x","choices":[{"delta":{"content":" there"}}]}\n\n',
+        b'data: ' + json.dumps({"id": "x", "choices": [], "usage": usage}).encode() + b"\n\n",
+        b"data: [DONE]\n\n",
+    ]
+    upstream = make_sse_upstream_server("/v1/chat/completions", events)
+    upstream_client = await aiohttp_client(upstream)
+    upstream_base = str(upstream_client.make_url("")).rstrip("/")
+
+    config = {
+        "node": {"id": "athena"},
+        "proxy": {"listen_host": "localhost", "listen_port": 0,
+                  "upstream_url": upstream_base},
+        "database": {"path": db_path},
+        "logging": {"level": "CRITICAL"},
+    }
+    sidecar_app = create_app(Config.from_dict(config))
+
+    async with TestClient(TestServer(sidecar_app)) as sc:
+        resp = await sc.post(
+            "/v1/chat/completions",
+            json={
+                "model": "stream-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type", "").startswith("text/event-stream")
+        body = await resp.read()
+
+    # Client received every byte of the SSE stream verbatim.
+    assert body == b"".join(events)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT model, prompt_tokens, completion_tokens, total_tokens, endpoint "
+            "FROM token_usage",
+        )
+        rows = list(cur.fetchall())
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    model, pt, ct, tt, endpoint = rows[0]
+    assert model == "stream-model"
+    assert (pt, ct, tt) == (7, 3, 10)
+    assert endpoint == "/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_proxy_sse_stream_without_usage_chunk_logs_nothing(db_path, aiohttp_client):
+    """A streamed response with no `usage` chunk forwards cleanly and logs no row."""
+    events = [
+        b'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    upstream = make_sse_upstream_server("/v1/chat/completions", events)
+    upstream_client = await aiohttp_client(upstream)
+    upstream_base = str(upstream_client.make_url("")).rstrip("/")
+
+    config = {
+        "proxy": {"listen_host": "localhost", "listen_port": 0,
+                  "upstream_url": upstream_base},
+        "database": {"path": db_path},
+        "logging": {"level": "CRITICAL"},
+    }
+    sidecar_app = create_app(Config.from_dict(config))
+
+    async with TestClient(TestServer(sidecar_app)) as sc:
+        resp = await sc.post(
+            "/v1/chat/completions",
+            json={"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status == 200
+        assert (await resp.read()) == b"".join(events)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM token_usage")
+        assert cur.fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

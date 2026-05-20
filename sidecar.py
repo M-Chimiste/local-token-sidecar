@@ -51,6 +51,90 @@ def extract_model(body: dict[str, Any]) -> str:
     return body.get("model") or "unknown"
 
 
+# Cap the SSE tail we retain in memory. OpenAI-compatible streams emit the
+# `usage` chunk as the second-to-last event (right before `data: [DONE]`),
+# so a small rolling window is enough even for multi-megabyte streams.
+_SSE_TAIL_CAP_BYTES = 16 * 1024
+
+
+def _extract_sse_usage(buffer: bytes) -> dict | None:
+    """
+    Scan an SSE buffer for the last `data: {...}` chunk whose JSON payload
+    contains a dict-shaped ``usage`` field, and return it.
+
+    Clients that opt into ``stream_options.include_usage: true`` (Hermes Agent
+    and the OpenAI Python SDK do this for streaming) receive a final
+    ``{...,"usage":{...}}`` chunk just before ``[DONE]``. Clients that don't
+    opt in simply won't have a usage chunk, and this returns None.
+    """
+    if not buffer:
+        return None
+    last_usage: dict | None = None
+    for raw_line in buffer.split(b"\n"):
+        line = raw_line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            usage = obj.get("usage")
+            if isinstance(usage, dict):
+                last_usage = usage
+    return last_usage
+
+
+def _log_usage_row(
+    *,
+    db_path: str,
+    node_id: str,
+    endpoint: str,
+    status_code: int,
+    body_bytes: bytes,
+    usage: dict,
+    elapsed_ms: float,
+) -> None:
+    """Queue one local SQLite outbox row from an extracted ``usage`` dict."""
+    prompt_tokens     = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    total_tokens      = usage.get("total_tokens", 0) or 0
+
+    model_name = "unknown"
+    try:
+        req_json = json.loads(body_bytes)
+        model_name = extract_model(req_json)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    try:
+        _db.log_token_usage(
+            db_path=db_path,
+            node_id=node_id,
+            endpoint=endpoint,
+            status_code=status_code,
+            model=model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            response_ms=elapsed_ms,
+        )
+        logger.info(
+            "tokens queued  node=%s  model=%-30s  prompt=%5d  "
+            "completion=%5d  total=%6d  (%.1fms)",
+            node_id, model_name, prompt_tokens,
+            completion_tokens, total_tokens, elapsed_ms,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to queue token usage locally; returning "
+            "upstream response unchanged"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Core proxy logic
 # ---------------------------------------------------------------------------
@@ -99,6 +183,54 @@ async def forward_and_intercept(
                 data=body_bytes,
                 timeout=aiohttp.ClientTimeout(total=None),
             ) as upstream_resp:
+                upstream_ct = upstream_resp.headers.get("Content-Type", "")
+                is_sse = "text/event-stream" in upstream_ct.lower()
+
+                if is_sse:
+                    # Stream upstream chunks straight to the client, tee a
+                    # small rolling tail into a buffer, and parse it for the
+                    # final `usage` event once the stream ends.
+                    out_headers = {
+                        k: v for k, v in upstream_resp.headers.items()
+                        if k.lower() not in {
+                            "connection", "transfer-encoding",
+                            "content-encoding", "content-length",
+                        }
+                    }
+                    stream_resp = web.StreamResponse(
+                        status=upstream_resp.status,
+                        headers=out_headers,
+                    )
+                    await stream_resp.prepare(request)
+
+                    sse_tail = bytearray()
+                    try:
+                        async for chunk in upstream_resp.content.iter_any():
+                            await stream_resp.write(chunk)
+                            sse_tail.extend(chunk)
+                            if len(sse_tail) > _SSE_TAIL_CAP_BYTES:
+                                del sse_tail[:-_SSE_TAIL_CAP_BYTES]
+                    except (ConnectionResetError, asyncio.CancelledError):
+                        # Client disconnected mid-stream — still try to log
+                        # whatever usage chunk we already captured.
+                        pass
+                    with contextlib.suppress(Exception):
+                        await stream_resp.write_eof()
+
+                    elapsed_ms = (time.perf_counter() - start_ms) * 1000
+                    usage = _extract_sse_usage(bytes(sse_tail))
+                    if usage:
+                        _log_usage_row(
+                            db_path=db_path,
+                            node_id=node_id,
+                            endpoint=request.path,
+                            status_code=upstream_resp.status,
+                            body_bytes=body_bytes,
+                            usage=usage,
+                            elapsed_ms=elapsed_ms,
+                        )
+                    return stream_resp
+
                 response_body = await upstream_resp.read()
                 elapsed_ms = (time.perf_counter() - start_ms) * 1000
 
@@ -106,44 +238,16 @@ async def forward_and_intercept(
                 try:
                     resp_json = json.loads(response_body)
                     raw_usage = resp_json.get("usage")
-
                     if isinstance(raw_usage, dict):
-                        prompt_tokens     = raw_usage.get("prompt_tokens", 0) or 0
-                        completion_tokens = raw_usage.get("completion_tokens", 0) or 0
-                        total_tokens      = raw_usage.get("total_tokens", 0) or 0
-
-                        # Extract model name from request body
-                        model_name = "unknown"
-                        try:
-                            req_json = json.loads(body_bytes)
-                            model_name = extract_model(req_json)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-
-                        try:
-                            _db.log_token_usage(
-                                db_path=db_path,
-                                node_id=node_id,
-                                endpoint=request.path,
-                                status_code=upstream_resp.status,
-                                model=model_name,
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                total_tokens=total_tokens,
-                                response_ms=elapsed_ms,
-                            )
-                            logger.info(
-                                "tokens queued  node=%s  model=%-30s  prompt=%5d  "
-                                "completion=%5d  total=%6d  (%.1fms)",
-                                node_id, model_name, prompt_tokens,
-                                completion_tokens, total_tokens, elapsed_ms,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Failed to queue token usage locally; returning "
-                                "upstream response unchanged"
-                            )
-
+                        _log_usage_row(
+                            db_path=db_path,
+                            node_id=node_id,
+                            endpoint=request.path,
+                            status_code=upstream_resp.status,
+                            body_bytes=body_bytes,
+                            usage=raw_usage,
+                            elapsed_ms=elapsed_ms,
+                        )
                 except json.JSONDecodeError:
                     # Non-JSON response — can happen on some error paths; ignore usage.
                     pass
