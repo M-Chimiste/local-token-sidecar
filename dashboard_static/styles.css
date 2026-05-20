@@ -470,25 +470,60 @@ html[data-theme="terminal"] .host-bar .seg-bar:not(:last-child) { border-right: 
   font-size: 11.5px;
   display: flex; flex-direction: column;
   max-height: 280px;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   gap: 0;
 }
 .feed-row {
   display: grid;
-  grid-template-columns: 78px 110px 140px 1fr 70px 60px;
-  gap: 14px;
+  /* time | host | model (flex, ellipsis) | in/out (nowrap) | tokens | ms */
+  grid-template-columns:
+    64px
+    minmax(56px, max-content)
+    minmax(96px, 1fr)
+    max-content
+    minmax(48px, max-content)
+    minmax(56px, max-content);
+  gap: 10px;
   padding: 6px 0;
   border-bottom: 1px dashed var(--line);
   color: var(--text-2);
   align-items: center;
 }
+/* Allow grid children to shrink below their content size so ellipsis works. */
+.feed-row > span { min-width: 0; }
 .feed-row:last-child { border-bottom: 0; }
-.feed-row .t { color: var(--text-3); }
-.feed-row .m { color: var(--text); display: flex; align-items: center; gap: 7px; }
-.feed-row .m .dot { width: 7px; height: 7px; border-radius: 2px; background: var(--c); }
-.feed-row .h { color: var(--text-2); }
-.feed-row .toks { color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
-.feed-row .ms { text-align: right; font-variant-numeric: tabular-nums; }
+.feed-row .t { color: var(--text-3); white-space: nowrap; }
+.feed-row .h {
+  color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.feed-row .m {
+  color: var(--text);
+  display: flex; align-items: center; gap: 7px;
+  overflow: hidden;
+}
+.feed-row .m .dot {
+  width: 7px; height: 7px; border-radius: 2px; background: var(--c);
+  flex-shrink: 0;
+}
+.feed-row .m .m-name {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  min-width: 0;
+}
+.feed-row .io {
+  color: var(--text-3); font-size: 10.5px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.feed-row .toks {
+  color: var(--text); font-variant-numeric: tabular-nums;
+  text-align: right; white-space: nowrap;
+}
+.feed-row .ms {
+  text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .feed-row.new { animation: flashin 1.4s ease-out; }
 @keyframes flashin {
   from { background: color-mix(in oklch, var(--accent) 18%, transparent); }
