@@ -14,8 +14,8 @@ launchd:
   label: "com.athena.token-sidecar"
 
 dashboard:
-  enabled: false                 # gate for setup_launchd.py install --service dashboard
+  enabled: true                  # gate for setup_launchd.py install --service dashboard
   listen_host: "0.0.0.0"
-  listen_port: 8080
+  listen_port: 8088
   feed_initial_rows: 50
   poll_interval_ms: 2200
