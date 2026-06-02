@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Canonical agent guide
 
-[AGENTS.md](AGENTS.md) is the operating guide for coding agents in this repo and is kept in sync with the code. Read it first — this file only highlights the load-bearing parts and adds a few Claude-specific notes. Also worth scanning before non-trivial changes: [README.md](README.md), [project_status.md](project_status.md), [project_docs/requirements.md](project_docs/requirements.md), and [project_docs/schema.md](project_docs/schema.md).
+[AGENTS.md](AGENTS.md) is the operating guide for coding agents in this repo and is kept in sync with the code. Read it first — this file only highlights the load-bearing parts and adds a few Claude-specific notes. Also worth scanning before non-trivial changes: [README.md](README.md), [project_status.md](project_status.md), and [project_docs/schema.md](project_docs/schema.md).
+
+For the **Token Oracle** hardware-dashboard initiative (see its own section below), the spec lives in the `project_docs/` memory bank: [project_docs/requirements.md](project_docs/requirements.md) (now describes the Oracle, not the sidecar's original intent), [project_docs/design.md](project_docs/design.md), [project_docs/implementation-plan.md](project_docs/implementation-plan.md), and the locked visual mockup [project_docs/oracle_final.html](project_docs/oracle_final.html).
 
 ## What this project is
 
@@ -25,6 +27,21 @@ Other invariants worth knowing:
 - **Config validation lives in [config_loader.py](config_loader.py)** and `Config` is `frozen=True`. When `central.enabled` is true it also requires a non-default `node.id` and a DSN present in `os.environ[central.dsn_env]` — fail loudly at startup, not at flush time.
 - **LaunchAgent label is `com.athena.token-sidecar`** and the plist is regenerated from `config.yaml` by [setup_launchd.py](setup_launchd.py). When central sync is enabled, the install step copies the configured DSN env var from the current shell into the plist (mode `0600`); plain-cfg installs use mode `0644`.
 - **The catch-all proxy route** ([sidecar.py:273-274](sidecar.py#L273-L274)) forwards any unmatched GET/POST to upstream and will still extract `usage` if the response happens to be an OpenAI-shaped JSON dict — useful for tracking endpoints we haven't explicitly listed.
+
+## Token Oracle (planned hardware dashboard — not yet built)
+
+The `hardware-dashboard` branch adds **Token Oracle**: a round 480×480 ESP32-S3 touch display that renders fleet token usage as a Greek "pantheon" of three faces (Night Sky, Pantheon, Ephemeris). **No Oracle code exists in the repo yet** — `project_docs/` is the spec; treat it as the plan, not shipped code. Two new components are planned (layout in [implementation-plan.md §8](project_docs/implementation-plan.md)):
+
+- **Metrics API** — a read-only FastAPI + psycopg-v3 service on `nyx`, co-located with Postgres and run under launchd. Serves `GET /metrics` (the aggregated JSON in [implementation-plan.md §4](project_docs/implementation-plan.md)) and `GET /health`. Same-day fields aggregate over local-day UTC bounds; history fields (`trend`, `high_water`, `streak_days`) come from a `daily_totals` rollup.
+- **Firmware** — ESPHome + LVGL for the Waveshare ESP32-S3-Touch-LCD-2.8C (verified pin map in [implementation-plan.md §3](project_docs/implementation-plan.md)).
+
+Claude-specific things to hold onto:
+
+- It is a **second, independent read-only consumer** of the central Postgres — a sibling to [dashboard.py](dashboard.py), **not a replacement**. The sidecar and its sync contracts are untouched; the Oracle never writes.
+- **All aggregation happens on `nyx`.** The MCU parses one small JSON document — never push heavy JSON or math onto the device. The ESP32 is not on the tailnet; it polls `nyx`'s LAN IP over plain HTTP.
+- **Tokens only — never cost or currency** ([requirements.md §2](project_docs/requirements.md)). This is an explicit product decision.
+- **Verdigris (`#46c2a6`) is reserved exclusively for "ascendant / alive"** (the node generating right now). Gold is the default; never use verdigris decoratively — it's the single most load-bearing visual rule.
+- Build order is deliberate: **data plumbing → board bring-up → hardest face (Night Sky) first.** Match [oracle_final.html](project_docs/oracle_final.html) for look/proportions/motion.
 
 ## Development commands
 
@@ -72,4 +89,4 @@ Several actions in this repo affect the user's local machine beyond the repo:
 
 ## Dependency policy
 
-Runtime stack is intentionally narrow: `aiohttp`, `click`, `httpx`, `psycopg[binary]`, `pyyaml`, `tabulate`, plus `pytest` / `pytest-aiohttp` / `pytest-asyncio` for tests. Don't add new top-level deps for one-off needs.
+Runtime stack is intentionally narrow: `aiohttp`, `click`, `httpx`, `psycopg[binary]`, `pyyaml`, `tabulate`, plus `pytest` / `pytest-aiohttp` / `pytest-asyncio` for tests. Don't add new top-level deps for one-off needs. The Token Oracle metrics API would add FastAPI + uvicorn — **not** in the current set; confirm before adding and keep them scoped to that service so the sidecar's runtime stays narrow.
