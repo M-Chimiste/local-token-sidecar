@@ -155,13 +155,13 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
             await cur.execute(
                 f"""
                 /* oracle:node_totals */
-                SELECT node_id, COALESCE(SUM(total_tokens), 0)::bigint
+                SELECT node_id, COALESCE(SUM(total_tokens), 0)::bigint AS tokens
                 FROM token_usage
                 WHERE {PROBE_FILTER_SQL}
                   AND timestamp >= %s
                   AND timestamp < %s
                 GROUP BY node_id
-                ORDER BY total_tokens DESC, node_id ASC
+                ORDER BY tokens DESC, node_id ASC
                 """,
                 [today_start, tomorrow_start],
             )

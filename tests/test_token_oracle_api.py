@@ -251,6 +251,14 @@ async def test_metrics_stable_node_order_and_live_flag(client):
     assert by_name["metis"] == {"name": "metis", "total": 0, "live": False}
 
 
+async def test_node_totals_orders_by_aggregate_alias(client, fake_pool):
+    await client.get("/metrics")
+    sql = next(call["sql"] for call in fake_pool.calls if "oracle:node_totals" in call["sql"])
+    assert "AS tokens" in sql
+    assert "ORDER BY tokens DESC, node_id ASC" in sql
+    assert "ORDER BY total_tokens" not in sql
+
+
 async def test_metrics_history_fields(client):
     r = await client.get("/metrics")
     j = await r.json()

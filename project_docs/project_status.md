@@ -8,25 +8,20 @@
 
 ## Current Recommendation
 
-**Deploy Phase 0 on `nyx` before progressing to Phase 1.**
+**Phase 0 is deployed on `nyx`; proceed to Phase 1 board bring-up once the
+ESP32 can reach the LAN endpoint.**
 
 Reason: Phase 1 board bring-up depends on a stable LAN `/metrics` endpoint.
-Validate the read-only API on the Postgres box first, then move to ESPHome
-hardware bring-up and a throwaway `today.total` label.
+The read-only API is now installed under launchd on the Postgres box and has
+been validated from `localhost` and `Nyx.local`.
 
-Recommended deployment gate:
+Deployment state:
 
-1. Copy/sync this repo state to `nyx`.
-2. Ensure `TOKEN_SIDECAR_QUERY_DSN` is available in the live environment,
-   repo `.env`, `~/.token_sidecar/env.sh`, or `~/.token_sidecar/postgres.env`.
-3. Set `oracle.enabled: true` on `nyx` only.
-4. Run manually first:
-   `uv run python api/token_oracle_api.py`
-5. From a LAN client, verify:
-   `curl -s http://<nyx-lan-ip>:8090/health`
-   and `curl -s http://<nyx-lan-ip>:8090/metrics | jq`.
-6. Install launchd after the manual smoke test:
-   `uv run python setup_launchd.py install --service oracle`.
+- `com.athena.token-oracle-api` is loaded via
+  `~/Library/LaunchAgents/com.athena.token-oracle-api.plist`.
+- `GET http://localhost:8090/health` returns `{"status":"ok"}`.
+- `GET http://Nyx.local:8090/metrics` returns the stable Oracle payload with
+  `ok:true`.
 
 ---
 
@@ -34,8 +29,8 @@ Recommended deployment gate:
 
 | Phase | Name | Status | Notes |
 |---|---|---|---|
-| 0 | Data plumbing | Complete locally; ready for nyx smoke deploy | aiohttp `/metrics` API, on-the-fly rollups, launchd support, full tests green |
-| 1 | Board bring-up | Not started | Start only after `/metrics` is stable over LAN |
+| 0 | Data plumbing | Deployed on nyx | aiohttp `/metrics` API, on-the-fly rollups, launchd support, targeted tests green |
+| 1 | Board bring-up | Not started | Start after ESP32 confirms reachability to `http://Nyx.local:8090/metrics` |
 | 2 | Face framework | Not started | Depends on firmware polling and JSON globals pattern |
 | 3 | Three faces | Not started | Prototype Night Sky render path first |
 | 4 | Interaction | Not started | Touch first; QMI8658 can follow |
@@ -79,11 +74,8 @@ integration.
 
 ## Open Risks / Watch Items
 
-- Live `nyx` deployment has not been performed from this machine.
-- Confirm LAN reachability to `http://<nyx-lan-ip>:8090/metrics` before any
-  firmware work.
-- Confirm the reader role on `nyx` has sufficient `SELECT` access to
-  `token_usage`.
+- Confirm ESP32-side reachability to `http://Nyx.local:8090/metrics` before
+  locking firmware polling behavior.
 - Validate real data shape: unknown `node_id` values append after configured
   gods; check whether that is acceptable before firmware layout is locked.
 - Phase 0 intentionally omits ill-omen and today-vs-yesterday fields because
@@ -92,6 +84,20 @@ integration.
 ---
 
 ## Session Log
+
+### 2026-06-02 — Phase 0 Nyx Deployment
+
+- Deployed `api/token_oracle_api.py` on `Nyx.local` as launchd service
+  `com.athena.token-oracle-api`.
+- Preserved local nyx runtime config, including `oracle.enabled: true`,
+  `0.0.0.0:8090`, and node order with `theseus`.
+- Fixed the live Postgres node-totals query to order by the aggregate alias
+  instead of the raw `total_tokens` column.
+- Verified `GET /health` and `GET /metrics` from `localhost` and `Nyx.local`;
+  `/metrics` returns `ok:true`.
+- Targeted verification passed:
+  `uv run python -m pytest tests/test_token_oracle_api.py tests/test_launchd.py -q`
+  → **36 passed**.
 
 ### 2026-06-02 — Phase 0 Local Implementation
 
