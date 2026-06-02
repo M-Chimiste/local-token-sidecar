@@ -176,6 +176,26 @@
 
 ---
 
+### ✅ Phase 9 — Token Oracle Data Plumbing
+**Status:** Complete
+**Completed:** 2026-06-02
+
+| Step | Description | Status |
+|------|-------------|--------|
+| 1 | Add shared `pg_common.py` helpers for probe filtering, JSON responses, UTC ISO rendering, timezone validation, and simple env-file DSN lookup | ✅ |
+| 2 | Extend config with `oracle.*` settings and stable node order (`nyx`, `mnemosyne`, `athena`, `metis`) | ✅ |
+| 3 | Add `api/token_oracle_api.py`, a separate read-only aiohttp service exposing `/health` and `/metrics` from central Postgres | ✅ |
+| 4 | Compute same-day metrics, ascendant/live state, hourly buckets, model/node totals, trend, high-water, and streak on the fly from `token_usage` | ✅ |
+| 5 | Add `setup_launchd.py --service oracle` with label `com.athena.token-oracle-api`, env-file sourcing, preflight checks, and Oracle logs | ✅ |
+| 6 | Add focused config, shared-helper, API, dashboard, and launchd tests | ✅ |
+| 7 | Verification: **157 passed + 2 skipped** across full test suite | ✅ |
+
+**Design note:** Token Oracle Phase 0 does not change the sidecar request path
+and does not add FastAPI/uvicorn. Firmware and rendered faces remain future
+phases.
+
+---
+
 ## Discovery Notes
 
 ### LM Studio Port
@@ -219,22 +239,28 @@ launchd:
 
 ---
 
-## All Phases Complete
+## All Sidecar Core Phases Complete
 
-All 8 phases implemented, tested, and documented. The token-sidecar is production-ready for local SQLite usage and optional central Postgres reporting.
+All 8 original sidecar phases are implemented, tested, and documented. The
+token-sidecar is production-ready for local SQLite usage and optional central
+Postgres reporting. Token Oracle Phase 0 data plumbing is now implemented as an
+additional read-only service.
 
 **Git history:** 15 commits (`4c6099a` → `7fc6ca3`)
-**Test suite:** 84 passed + 2 skipped (INT-08 launchd respawn and optional live Postgres test)
+**Test suite:** 157 passed + 2 skipped (INT-08 launchd respawn and optional live Postgres test)
 
 ---
 
-## File Inventory (after Phase 8)
+## File Inventory (after Phase 9)
 
 ```
 token_sidecar/
 ├── .git/                    # commits: 4c6099a → 7fc6ca3 (15 total)
 ├── .venv/                   # uv virtual environment
 ├── README.md                ← architecture, central reporting setup, usage, troubleshooting
+├── api/
+│   ├── __init__.py
+│   └── token_oracle_api.py  ← Token Oracle read-only metrics API
 ├── queries/
 │   ├── __init__.py          ← from Phase 5 (package marker)
 │   └── summary.py           ← CLI: daily/hourly/by-model, SQLite or Postgres backend
@@ -243,15 +269,20 @@ token_sidecar/
 │   ├── test_central_sync.py ← Postgres flush orchestration
 │   ├── test_proxy.py        ← proxy behavior and config validation
 │   ├── test_launchd.py      ← LaunchAgent plist/lifecycle behavior
+│   ├── test_pg_common.py    ← shared Postgres/API helpers
+│   ├── test_token_oracle_api.py ← Token Oracle /health and /metrics API behavior
+│   ├── test_dashboard.py    ← dashboard API behavior
+│   ├── test_dashboard_queries.py ← dashboard query helpers
 │   ├── test_queries.py      ← CLI behavior
 │   ├── test_integration.py  ← live sidecar/LM Studio integration
 │   └── test_postgres_integration.py ← optional live Postgres integration
 ├── db.py                    ← SQLite outbox/cache and local summaries
 ├── postgres_store.py        ← central Postgres schema, inserts, summaries
 ├── central_sync.py          ← local outbox to Postgres batch sync
+├── pg_common.py             ← shared read-service helpers
 ├── sidecar.py               ← aiohttp proxy + background sync lifecycle
-├── config_loader.py         ← config, node id, central sync settings
-├── setup_launchd.py         ← LaunchAgent generation with env var support
+├── config_loader.py         ← sidecar, dashboard, central sync, and oracle settings
+├── setup_launchd.py         ← LaunchAgent generation with sidecar/dashboard/oracle support
 ├── scripts/
 │   ├── setup_nyx_postgres.sh  ← nyx Homebrew Postgres setup wrapper
 │   ├── bootstrap_postgres.py  ← central DB/role/schema/grant bootstrap
@@ -264,4 +295,4 @@ token_sidecar/
 
 ---
 
-*Last updated: 2026-05-18 (Phase 8 complete — central Postgres reporting)*
+*Last updated: 2026-06-02 (Phase 9 complete — Token Oracle data plumbing)*

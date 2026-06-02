@@ -26,9 +26,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from setup_launchd import (
     generate_plist_content,
     generate_dashboard_plist_content,
+    generate_oracle_plist_content,
     PLIST_LABEL,
     DASHBOARD_PLIST_LABEL,
+    ORACLE_PLIST_LABEL,
     DASHBOARD_ENV_FILE,
+    LOCAL_ENV_FILE,
+    POSTGRES_ENV_FILE,
 )
 
 
@@ -428,3 +432,143 @@ def test_dashboard_plist_is_valid_xml(
     assert parsed["Label"] == DASHBOARD_PLIST_LABEL
     assert str(tmp_path / "dashboard.log") == parsed["StandardOutPath"]
     assert str(tmp_path / "dashboard.error.log") == parsed["StandardErrorPath"]
+
+
+# -----------------------------------------------------------------------
+# Tests — oracle plist / preflight
+# -----------------------------------------------------------------------
+
+@pytest.fixture
+def oracle_script(project_dir: pathlib.Path) -> pathlib.Path:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    api_dir = project_dir / "api"
+    api_dir.mkdir(parents=True, exist_ok=True)
+    p = api_dir / "token_oracle_api.py"
+    p.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    return p
+
+
+def test_oracle_plist_uses_correct_label(
+    project_dir: pathlib.Path,
+    oracle_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_oracle_plist_content(
+        project_dir, oracle_script,
+        tmp_path / "oracle.log", tmp_path / "oracle.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["Label"] == ORACLE_PLIST_LABEL
+    assert parsed["Label"] != DASHBOARD_PLIST_LABEL
+    assert parsed["Label"] != PLIST_LABEL
+
+
+def test_oracle_plist_sources_env_files_and_execs_python(
+    project_dir: pathlib.Path,
+    oracle_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_oracle_plist_content(
+        project_dir, oracle_script,
+        tmp_path / "oracle.log", tmp_path / "oracle.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    args = parsed["ProgramArguments"]
+    assert args[0] == "/bin/sh"
+    assert args[1] == "-c"
+    wrapper = args[2]
+    assert str(LOCAL_ENV_FILE) in wrapper
+    assert str(DASHBOARD_ENV_FILE) in wrapper
+    assert str(POSTGRES_ENV_FILE) in wrapper
+    assert "set -a" in wrapper
+    assert "exec" in wrapper
+    assert str(oracle_script.resolve()) in wrapper
+
+
+def test_oracle_plist_keep_alive_uses_successful_exit_false(
+    project_dir: pathlib.Path,
+    oracle_script: pathlib.Path,
+    tmp_path: pathlib.Path,
+) -> None:
+    xml = generate_oracle_plist_content(
+        project_dir, oracle_script,
+        tmp_path / "oracle.log", tmp_path / "oracle.error.log",
+    )
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["KeepAlive"] == {"SuccessfulExit": False}
+    assert parsed["RunAtLoad"] is True
+    assert str(tmp_path / "oracle.log") == parsed["StandardOutPath"]
+    assert str(tmp_path / "oracle.error.log") == parsed["StandardErrorPath"]
+
+
+def test_oracle_preflight_requires_enabled_gate() -> None:
+    from config_loader import CentralDatabaseConfig, Config
+    from setup_launchd import _oracle_preflight
+
+    cfg = Config(
+        listen_host="localhost",
+        listen_port=1240,
+        upstream_url="http://localhost:1234",
+        database_path=pathlib.Path("/tmp/tokens.db"),
+        log_level="INFO",
+        node_id="test",
+        central=CentralDatabaseConfig(),
+        _raw={},
+    )
+    errors = _oracle_preflight(cfg)
+    assert any("oracle.enabled is false" in err for err in errors)
+
+
+def test_oracle_preflight_accepts_repo_dotenv(monkeypatch, tmp_path: pathlib.Path) -> None:
+    from config_loader import CentralDatabaseConfig, Config, OracleConfig
+    from setup_launchd import _oracle_preflight
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("TOKEN_SIDECAR_QUERY_DSN=postgresql://example\n", encoding="utf-8")
+
+    cfg = Config(
+        listen_host="localhost",
+        listen_port=1240,
+        upstream_url="http://localhost:1234",
+        database_path=pathlib.Path("/tmp/tokens.db"),
+        log_level="INFO",
+        node_id="test",
+        central=CentralDatabaseConfig(),
+        oracle=OracleConfig(enabled=True),
+        _raw={},
+    )
+
+    class FakeCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def execute(self, *_a, **_kw): pass
+        def fetchone(self): return (1,)
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def cursor(self): return FakeCursor()
+
+    monkeypatch.delenv("TOKEN_SIDECAR_QUERY_DSN", raising=False)
+    monkeypatch.setattr("setup_launchd.LOCAL_ENV_FILE", env_file)
+    monkeypatch.setattr("setup_launchd.DASHBOARD_ENV_FILE", tmp_path / "missing-env.sh")
+    monkeypatch.setattr("setup_launchd.POSTGRES_ENV_FILE", tmp_path / "missing-postgres.env")
+    monkeypatch.setattr("psycopg.connect", lambda *_a, **_kw: FakeConn())
+
+    assert _oracle_preflight(cfg) == []
+
+
+def test_unload_oracle_calls_oracle_launchctl_label() -> None:
+    from setup_launchd import unload
+
+    mock_run = MagicMock()
+    completed = MagicMock()
+    completed.stderr = b""
+    mock_run.return_value = completed
+
+    with patch("subprocess.run", mock_run):
+        unload(service="oracle")
+
+    call_args = mock_run.call_args[0][0]
+    assert call_args[:2] == ["launchctl", "bootout"]
+    assert call_args[3] == ORACLE_PLIST_LABEL

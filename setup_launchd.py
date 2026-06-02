@@ -34,9 +34,14 @@ PLIST_FILENAME = f"{PLIST_LABEL}.plist"
 DASHBOARD_PLIST_LABEL = "com.athena.token-sidecar-dashboard"
 DASHBOARD_PLIST_FILENAME = f"{DASHBOARD_PLIST_LABEL}.plist"
 
+ORACLE_PLIST_LABEL = "com.athena.token-oracle-api"
+ORACLE_PLIST_FILENAME = f"{ORACLE_PLIST_LABEL}.plist"
+
 # Optional env file the dashboard plist sources to get TOKEN_SIDECAR_QUERY_DSN
 # without baking secrets into the plist.
 DASHBOARD_ENV_FILE = pathlib.Path.home() / ".token_sidecar" / "env.sh"
+LOCAL_ENV_FILE = PROJECT_ROOT / ".env"
+POSTGRES_ENV_FILE = pathlib.Path.home() / ".token_sidecar" / "postgres.env"
 
 
 def _get_launch_agents_dir() -> pathlib.Path:
@@ -47,11 +52,17 @@ def _get_launch_agents_dir() -> pathlib.Path:
 def _get_plist_path(service: str = "sidecar") -> pathlib.Path:
     if service == "dashboard":
         return _get_launch_agents_dir() / DASHBOARD_PLIST_FILENAME
+    if service == "oracle":
+        return _get_launch_agents_dir() / ORACLE_PLIST_FILENAME
     return _get_launch_agents_dir() / PLIST_FILENAME
 
 
 def _label_for(service: str) -> str:
-    return DASHBOARD_PLIST_LABEL if service == "dashboard" else PLIST_LABEL
+    if service == "dashboard":
+        return DASHBOARD_PLIST_LABEL
+    if service == "oracle":
+        return ORACLE_PLIST_LABEL
+    return PLIST_LABEL
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +152,49 @@ def generate_dashboard_plist_content(
     return buf.decode("utf-8")
 
 
+def _source_env_fragment(path: pathlib.Path) -> str:
+    """Shell fragment that sources an env file and exports simple assignments."""
+    return f'if [ -f "{path}" ]; then set -a; . "{path}"; set +a; fi'
+
+
+def generate_oracle_plist_content(
+    project_dir: pathlib.Path,
+    oracle_script: pathlib.Path,
+    log_out_path: pathlib.Path,
+    log_err_path: pathlib.Path,
+) -> str:
+    """
+    Build the Token Oracle API LaunchAgent plist.
+
+    Sources repo `.env`, ~/.token_sidecar/env.sh, and postgres.env before
+    exec'ing python so local development and installed nyx setups both work.
+    """
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python3"
+    python_exe = pathlib.Path(os.path.abspath(str(venv_python)))
+    oracle_path = oracle_script.resolve()
+
+    wrapper = (
+        f"{_source_env_fragment(LOCAL_ENV_FILE)}; "
+        f"{_source_env_fragment(DASHBOARD_ENV_FILE)}; "
+        f"{_source_env_fragment(POSTGRES_ENV_FILE)}; "
+        f'exec "{python_exe}" "{oracle_path}"'
+    )
+
+    plist_data = {
+        "Label": ORACLE_PLIST_LABEL,
+        "ProgramArguments": ["/bin/sh", "-c", wrapper],
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": str(log_out_path),
+        "StandardErrorPath": str(log_err_path),
+        "WorkingDirectory": str(project_dir),
+        "ProcessType": "Background",
+    }
+
+    buf = plistlib.dumps(plist_data, sort_keys=False)
+    return buf.decode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Pre-flight checks (dashboard install)
 # ---------------------------------------------------------------------------
@@ -209,6 +263,60 @@ def _dashboard_preflight(cfg) -> list[str]:
     return errors
 
 
+def _oracle_preflight(cfg) -> list[str]:
+    """
+    Return human-readable Token Oracle launchd preflight failures.
+
+    Checks config gate, DSN discoverability, imports, and a SELECT 1 round-trip.
+    """
+    errors: list[str] = []
+
+    if not cfg.oracle.enabled:
+        errors.append(
+            "config.yaml: oracle.enabled is false. "
+            "Flip it to true on the postgres box before installing the oracle plist."
+        )
+
+    try:
+        from pg_common import resolve_env_value
+        dsn = resolve_env_value(
+            cfg.oracle.dsn_env,
+            (LOCAL_ENV_FILE, DASHBOARD_ENV_FILE, POSTGRES_ENV_FILE),
+        )
+    except Exception as exc:
+        errors.append(f"could not inspect Oracle DSN env files: {exc}")
+        dsn = None
+
+    if not dsn:
+        errors.append(
+            f"{cfg.oracle.dsn_env} is not set in this shell, {LOCAL_ENV_FILE}, "
+            f"{DASHBOARD_ENV_FILE}, or {POSTGRES_ENV_FILE}. Add an export like:\n"
+            f"    export {cfg.oracle.dsn_env}=postgresql://..."
+        )
+
+    try:
+        import aiohttp  # noqa: F401
+        import psycopg  # noqa: F401
+        import psycopg_pool  # noqa: F401
+    except ImportError as exc:
+        errors.append(
+            f"aiohttp/psycopg/psycopg_pool not importable in the active venv: {exc}. "
+            f"Run `uv sync` from {PROJECT_ROOT}."
+        )
+
+    if dsn and not errors:
+        try:
+            import psycopg
+            with psycopg.connect(dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+        except Exception as exc:
+            errors.append(f"could not reach Postgres with {cfg.oracle.dsn_env}: {exc}")
+
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
@@ -262,6 +370,20 @@ def install(config_path: Optional[str] = None, service: str = "sidecar") -> None
             log_out_path=log_dir / "dashboard.log",
             log_err_path=log_dir / "dashboard.error.log",
         )
+    elif service == "oracle":
+        errors = _oracle_preflight(cfg)
+        if errors:
+            sys.stderr.write("ERROR: oracle pre-flight checks failed:\n")
+            for e in errors:
+                sys.stderr.write(f"  - {e}\n")
+            sys.exit(1)
+
+        plist_content = generate_oracle_plist_content(
+            project_dir=PROJECT_ROOT,
+            oracle_script=PROJECT_ROOT / "api" / "token_oracle_api.py",
+            log_out_path=log_dir / "oracle.log",
+            log_err_path=log_dir / "oracle.error.log",
+        )
     else:
         config_file = (
             pathlib.Path(effective_config_path).expanduser().resolve()
@@ -287,7 +409,7 @@ def install(config_path: Optional[str] = None, service: str = "sidecar") -> None
     with open(plist_path, "w", encoding="utf-8") as fh:
         fh.write(plist_content)
     # If the sidecar plist embeds the central DSN, keep it owner-readable only.
-    if service != "dashboard" and cfg.central.enabled:
+    if service == "sidecar" and cfg.central.enabled:
         os.chmod(plist_path, 0o600)
     else:
         os.chmod(plist_path, 0o644)
@@ -389,7 +511,7 @@ def main() -> None:
     def _add_service_arg(p: argparse.ArgumentParser) -> None:
         p.add_argument(
             "--service",
-            choices=("sidecar", "dashboard"),
+            choices=("sidecar", "dashboard", "oracle"),
             default="sidecar",
             help="Which LaunchAgent to act on (default: sidecar).",
         )

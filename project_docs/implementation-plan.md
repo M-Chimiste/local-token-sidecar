@@ -9,7 +9,7 @@
 
 ```
  sidecar(s) ──writes──▶  Postgres on nyx  ──read──▶  metrics API (nyx)  ──HTTP/LAN──▶  ESP32 (ESPHome + LVGL)
- (per node)              token_usage (+         FastAPI, read-only,        polls /metrics       renders 3 faces
+ (per node)              token_usage (+         aiohttp, read-only,        polls /metrics       renders 3 faces
                           daily_totals view)     aggregates server-side      every 15–30s
 ```
 
@@ -24,7 +24,7 @@
 | Heavy visuals | LVGL **canvas** *or* display-layer lambda (TBD) | Starfield/constellations/spiral need custom draw; validate path early |
 | Standard widgets | LVGL `arc`, `label`, `bar`, `meter` | Rings, counts, gauges map directly |
 | IMU | **custom/external component** for QMI8658 | Not a first-class ESPHome component (confirm) |
-| Metrics API | **FastAPI + psycopg (v3)** on nyx | Co-located with Postgres; trivial read service |
+| Metrics API | **aiohttp + psycopg_pool / psycopg (v3)** on nyx | Co-located with Postgres; mirrors `dashboard.py`; no new runtime deps |
 | Process mgmt | launchd plist on nyx | Same pattern the sidecar uses |
 
 ## 3. Hardware Reference (verified ESPHome block for ESP32-S3-Touch-LCD-2.8C)
@@ -76,6 +76,8 @@ esp32: board esp32-s3-devkitc-1, flash 8MB, framework esp-idf, psram octal@80MHz
 - `GET /health` → `{"status":"ok"}`.
 - Node column assumed `node_id` (configurable). Timestamps UTC; "today" computed in a
   configured local TZ.
+- Runtime query errors return HTTP 200 with `ok: false` and safe zero/default
+  metric values so firmware can keep parsing a stable payload.
 
 ## 5. Postgres Rollups
 
@@ -101,6 +103,11 @@ GROUP BY 1;
 - Stand up the metrics API on nyx; implement same-day aggregation + the rollups in §5.
 - Validate `GET /metrics` shape from a LAN box (`curl | jq`).
 - **DoD:** stable JSON matching §4 over the LAN.
+
+Implementation decision for this repo: Phase 0 lives in `api/token_oracle_api.py`
+as a separate read-only aiohttp service. History fields are computed on the fly
+from grouped `token_usage` rows for v1; no `daily_totals` materialized view or
+refresh job is required yet.
 
 ### Phase 1 — Board bring-up
 - Flash the verified ESPHome hardware block; confirm panel + touch + Wi-Fi + OTA.
@@ -150,8 +157,7 @@ token-oracle/
     token_dash_helpers.h       # C++ helpers (compact number fmt, etc.)
     components/qmi8658/         # custom IMU component (Phase 4)
   api/
-    token_dashboard_api.py      # FastAPI metrics service for nyx
-    deploy/launchd.plist
+    token_oracle_api.py         # aiohttp metrics service for nyx
   memory-bank/
     requirements.md
     implementation-plan.md

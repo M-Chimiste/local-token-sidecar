@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 
 import yaml
 
+from pg_common import is_valid_timezone, resolve_env_value
+
 
 REQUIRED_KEYS: list[str] = [
     "proxy.listen_host",
@@ -27,6 +29,12 @@ REQUIRED_KEYS: list[str] = [
     "proxy.upstream_url",
     "database.path",
 ]
+
+_CONFIG_DIR = pathlib.Path(__file__).parent
+_LOCAL_ENV_FILE = _CONFIG_DIR / ".env"
+_USER_ENV_FILE = pathlib.Path.home() / ".token_sidecar" / "env.sh"
+_POSTGRES_ENV_FILE = pathlib.Path.home() / ".token_sidecar" / "postgres.env"
+_DSN_ENV_FILES = (_LOCAL_ENV_FILE, _USER_ENV_FILE, _POSTGRES_ENV_FILE)
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,35 @@ class DashboardConfig:
     listen_port: int = 8080
     feed_initial_rows: int = 50
     poll_interval_ms: int = 2200
+
+
+DEFAULT_ORACLE_NODES = ("nyx", "mnemosyne", "athena", "metis")
+
+
+@dataclass(frozen=True)
+class OracleConfig:
+    """
+    Read-only Token Oracle metrics API configuration.
+
+    Attributes:
+        enabled:                   Gate for launchd install preflight.
+        listen_host:               Bind address (default "0.0.0.0").
+        listen_port:               TCP port (default 8090).
+        timezone:                  IANA timezone used for local-day metrics.
+        budget:                    Daily token budget surfaced in /metrics.
+        ascendant_window_seconds:  Recency window for "alive" node detection.
+        dsn_env:                   Env var containing the read-side Postgres DSN.
+        nodes:                     Stable node/god order for zero-filled output.
+    """
+
+    enabled: bool = False
+    listen_host: str = "0.0.0.0"
+    listen_port: int = 8090
+    timezone: str = "America/New_York"
+    budget: int = 2_000_000
+    ascendant_window_seconds: int = 120
+    dsn_env: str = "TOKEN_SIDECAR_QUERY_DSN"
+    nodes: tuple[str, ...] = DEFAULT_ORACLE_NODES
 
 
 @dataclass(frozen=True)
@@ -76,6 +113,7 @@ class Config:
         database_path: Expanded filesystem path to the SQLite DB file.
         log_level:     Logging level string (DEBUG, INFO, WARNING, ERROR).
         dashboard:     Optional dashboard service settings (postgres box only).
+        oracle:        Optional Token Oracle metrics API settings.
         node_id:       Stable reporting identity for this sidecar machine.
         central:       Optional central Postgres sync configuration.
         _raw:          Original dict for forward compatibility.
@@ -89,6 +127,7 @@ class Config:
     node_id: str
     central: CentralDatabaseConfig
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    oracle: OracleConfig = field(default_factory=OracleConfig)
     _raw: dict = field(default_factory=dict)
 
     @classmethod
@@ -105,6 +144,7 @@ class Config:
         node = _get(d, "node") or {}
         logging_cfg = _get(d, "logging") or {}
         dashboard_cfg = _get(d, "dashboard") or {}
+        oracle_cfg = _get(d, "oracle") or {}
         central_cfg = database.get("central") or {}
 
         # Check for missing required keys (not log_level which is optional)
@@ -147,7 +187,11 @@ class Config:
         dsn_env = str(
             central_cfg.get("dsn_env", "TOKEN_SIDECAR_POSTGRES_DSN")
         )
-        central_dsn = os.environ.get(dsn_env)
+        central_dsn = (
+            resolve_env_value(dsn_env, _DSN_ENV_FILES)
+            if central_enabled
+            else None
+        )
         if central_enabled and not central_dsn:
             raise ValueError(
                 f"Central Postgres sync is enabled, but {dsn_env} is not set."
@@ -168,6 +212,8 @@ class Config:
             poll_interval_ms=int(dashboard_cfg.get("poll_interval_ms", 2200)),
         )
 
+        oracle = _oracle_from_dict(oracle_cfg)
+
         return cls(
             listen_host=str(proxy["listen_host"]),
             listen_port=int(proxy["listen_port"]),
@@ -184,6 +230,7 @@ class Config:
                 batch_size=batch_size,
             ),
             dashboard=dashboard,
+            oracle=oracle,
             _raw=dict(d),
         )
 
@@ -206,6 +253,58 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _oracle_from_dict(raw: dict) -> OracleConfig:
+    """Build and validate Token Oracle metrics API config."""
+    listen_port = int(raw.get("listen_port", 8090))
+    budget = int(raw.get("budget", 2_000_000))
+    window = int(raw.get("ascendant_window_seconds", 120))
+    timezone = str(raw.get("timezone", "America/New_York"))
+    nodes = _as_nodes(raw.get("nodes", DEFAULT_ORACLE_NODES))
+
+    if listen_port <= 0:
+        raise ValueError("oracle.listen_port must be > 0.")
+    if budget <= 0:
+        raise ValueError("oracle.budget must be > 0.")
+    if window <= 0:
+        raise ValueError("oracle.ascendant_window_seconds must be > 0.")
+    if not is_valid_timezone(timezone):
+        raise ValueError(f"oracle.timezone must be a valid IANA timezone: {timezone!r}.")
+    if not nodes:
+        raise ValueError("oracle.nodes must contain at least one node name.")
+
+    return OracleConfig(
+        enabled=_as_bool(raw.get("enabled", False)),
+        listen_host=str(raw.get("listen_host", "0.0.0.0")),
+        listen_port=listen_port,
+        timezone=timezone,
+        budget=budget,
+        ascendant_window_seconds=window,
+        dsn_env=str(raw.get("dsn_env", "TOKEN_SIDECAR_QUERY_DSN")),
+        nodes=nodes,
+    )
+
+
+def _as_nodes(value) -> tuple[str, ...]:
+    """Parse the stable Oracle node list from YAML."""
+    if isinstance(value, str):
+        raw_nodes = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_nodes = [str(part).strip() for part in value]
+    else:
+        raise ValueError("oracle.nodes must be a list of node names.")
+
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for node in raw_nodes:
+        if not node:
+            continue
+        if node in seen:
+            raise ValueError(f"oracle.nodes contains duplicate node name: {node!r}.")
+        seen.add(node)
+        nodes.append(node)
+    return tuple(nodes)
 
 
 def load_config(config_path: pathlib.Path | str | None = None) -> Config:

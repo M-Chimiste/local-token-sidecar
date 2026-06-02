@@ -1,6 +1,6 @@
 # Token Counter Sidecar
 
-**Python:** 3.11+ · **Tests:** 100 passing · **macOS only**
+**Python:** 3.11+ · **Tests:** 157 passing + 2 skipped · **macOS only**
 
 A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM API response, writes token usage to a local SQLite outbox, and can flush it to a central Postgres database for cross-machine reporting.
 
@@ -93,6 +93,14 @@ All settings live in `config.yaml` at the project root.
 | `database.central.dsn_env` | string | `"TOKEN_SIDECAR_POSTGRES_DSN"` | Env var containing the sidecar writer DSN |
 | `database.central.flush_interval_seconds` | number | `5` | Background flush interval after successful attempts |
 | `database.central.batch_size` | int | `100` | Maximum queued rows per central upload batch |
+| `oracle.enabled` | bool | `false` | Gate for `setup_launchd.py install --service oracle` |
+| `oracle.listen_host` | string | `"0.0.0.0"` | Interface the Token Oracle metrics API binds to |
+| `oracle.listen_port` | int | `8090` | Port for the Token Oracle metrics API |
+| `oracle.timezone` | string | `"America/New_York"` | IANA timezone used for local-day metrics |
+| `oracle.budget` | int | `2000000` | Daily token budget surfaced in `/metrics` |
+| `oracle.ascendant_window_seconds` | int | `120` | Recency window for live/ascendant detection |
+| `oracle.dsn_env` | string | `"TOKEN_SIDECAR_QUERY_DSN"` | Env var containing the read-side Postgres DSN |
+| `oracle.nodes` | list | `nyx,mnemosyne,athena,metis` | Stable node order for zero-filled `/metrics` output |
 | `logging.level` | string | `"INFO"` | Log level — one of `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 Override the config path at runtime:
@@ -289,6 +297,69 @@ message rather than crash-looping launchd.
 
 ---
 
+## Token Oracle Metrics API
+
+A read-only LAN API for the Token Oracle ESP32 display. It is a separate
+process from the sidecar and dashboard, reads only central Postgres, and serves
+one compact token-only JSON document for the device.
+
+### Run it
+
+```bash
+# The API checks the live env, repo .env, ~/.token_sidecar/env.sh,
+# then ~/.token_sidecar/postgres.env for TOKEN_SIDECAR_QUERY_DSN.
+uv run python api/token_oracle_api.py
+
+curl -s http://localhost:8090/health
+curl -s http://localhost:8090/metrics | jq
+```
+
+If the query DSN is missing, the process prints a clear error and exits 0 so
+launchd does not crash-loop. If the DSN is present but Postgres is unreachable
+at startup, startup raises so launchd can retry. Runtime query failures return
+HTTP 200 with `ok: false` and safe zero/default metric values so firmware can
+still parse the payload.
+
+### API
+
+| Path | Returns |
+| ---- | ------- |
+| `GET /health` | `{"status":"ok"}` without touching Postgres |
+| `GET /metrics` | Token Oracle payload from `project_docs/implementation-plan.md` §4 |
+
+`/metrics` computes local-day totals, per-node totals, 24 hourly buckets,
+ascendant/live state, ascendant model totals, trend, high-water, and active-day
+streak on the fly from `token_usage`. Probe rows are excluded using the same
+rules as the dashboard. The endpoint is intended for a trusted LAN only.
+
+### Install as a launchd service (postgres box only)
+
+```bash
+# 1. Put the reader DSN in one of the supported local env files.
+mkdir -p ~/.token_sidecar
+echo 'export TOKEN_SIDECAR_QUERY_DSN=postgresql://...' > ~/.token_sidecar/env.sh
+chmod 600 ~/.token_sidecar/env.sh
+
+# 2. Flip the gate in config.yaml
+#    oracle:
+#      enabled: true
+
+# 3. Install and start
+uv run python setup_launchd.py install --service oracle
+launchctl kickstart -kp gui/$(id -u)/com.athena.token-oracle-api
+
+# Status / unload / remove
+uv run python setup_launchd.py status --service oracle
+uv run python setup_launchd.py unload --service oracle
+uv run python setup_launchd.py remove --service oracle
+```
+
+The Oracle plist sources repo `.env`, `~/.token_sidecar/env.sh`, and
+`~/.token_sidecar/postgres.env`, then writes logs to
+`~/.token_sidecar/oracle.log` and `~/.token_sidecar/oracle.error.log`.
+
+---
+
 ## Install & Uninstall
 
 ### `./install.sh` — full setup
@@ -413,10 +484,12 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 |------|---------|
 | `sidecar.py` | Main proxy — aiohttp app, intercepts responses, logs to SQLite |
 | `dashboard.py` | Read-only dashboard service (postgres box) — serves the React UI and `/api/*` JSON endpoints |
+| `api/token_oracle_api.py` | Read-only Token Oracle metrics API for ESP32/LAN polling |
+| `pg_common.py` | Shared Postgres API helpers for probe filtering, JSON, UTC ISO, timezone validation, and env-file DSNs |
 | `dashboard_static/` | HTML/CSS/JSX assets for the dashboard, plus vendored React + Babel |
 | `db.py` | SQLite schema + CRUD helpers (`init_db`, `log_token_usage`, `get_daily_summary`, `get_hourly_summary`) |
-| `config_loader.py` | YAML config loader with typed `Config` + `DashboardConfig` dataclasses and `--config` CLI override |
-| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (`--service sidecar\|dashboard`) |
+| `config_loader.py` | YAML config loader with typed `Config`, `DashboardConfig`, and `OracleConfig` dataclasses |
+| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (`--service sidecar\|dashboard\|oracle`) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
 | `scripts/setup_nyx_postgres.sh` | One-shot nyx setup wrapper: start Homebrew Postgres and run central bootstrap |
 | `scripts/bootstrap_postgres.py` | One-shot central Postgres database, role, schema, and grant bootstrap |
@@ -430,7 +503,7 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 ## Development
 
 ```bash
-# Run the full test suite (100 tests)
+# Run the full test suite (157 passing + 2 skipped in current verification)
 uv run python -m pytest tests/ -v
 
 # Run a specific test file
@@ -439,4 +512,4 @@ uv run python -m pytest tests/test_db.py -v
 
 ---
 
-*Last updated: 2026-05-19*
+*Last updated: 2026-06-02*

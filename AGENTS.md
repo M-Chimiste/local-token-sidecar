@@ -85,6 +85,8 @@ below), the source of truth is the `project_docs/` memory bank:
 - `project_docs/requirements.md` — Token Oracle product requirements (vision,
   hardware, faces, data source, security). Note: this file now describes the
   Oracle, not the sidecar's original intent.
+- `project_docs/project_status.md` — Token Oracle current phase, deployment
+  recommendation, latest verification, open risks, and coding-session log.
 - `project_docs/design.md` — visual/interaction spec (palette, typography,
   the three faces, data→visual bindings).
 - `project_docs/implementation-plan.md` — architecture, the `/metrics` API
@@ -96,6 +98,11 @@ If the docs disagree with live code, inspect the tests and implementation before
 editing. Update docs when a behavior change intentionally changes user-facing
 commands, ports, schema, or launchd behavior.
 
+For every coding session that touches Token Oracle code, config, tests,
+deployment behavior, or docs, update `project_docs/project_status.md` before
+handoff with the session date, what changed, verification run, current risks,
+and the next recommended step.
+
 ## Repository Shape
 
 - `sidecar.py` builds the aiohttp app, forwards `/v1/chat/completions` and
@@ -106,6 +113,13 @@ commands, ports, schema, or launchd behavior.
   read-only: serves the React dashboard UI from `dashboard_static/` and JSON
   aggregates from the central Postgres via `psycopg_pool`. It does NOT touch
   SQLite, does NOT write to Postgres, and is independent of the sidecar process.
+- `api/token_oracle_api.py` is a separate read-only aiohttp service for the
+  Token Oracle ESP32 display. It serves `/health` and `/metrics`, reads central
+  Postgres via `TOKEN_SIDECAR_QUERY_DSN`, and soft-fails `/metrics` with
+  `ok:false` plus parseable defaults on runtime query errors.
+- `pg_common.py` owns shared read-service helpers: probe-row filtering, JSON
+  responses, UTC ISO formatting, IANA timezone validation, and simple env-file
+  DSN lookup.
 - `dashboard_static/` holds the dashboard's HTML/CSS/JSX assets plus vendored
   React + Babel-standalone (no CDN dependency at runtime).
 - `db.py` owns SQLite schema creation, inserts, and daily/hourly summary
@@ -169,14 +183,14 @@ commands, ports, schema, or launchd behavior.
   parameters before sending them to Postgres, and keep repeated `model=` /
   `node=` filters as narrowing filters.
 
-## Token Oracle (hardware dashboard — active initiative, pre-implementation)
+## Token Oracle (hardware dashboard — active initiative)
 
 The current branch (`hardware-dashboard`) adds **Token Oracle**: a round
 480×480 ESP32-S3 touch display that renders the fleet's token usage as a Greek
 "pantheon" of three faces (Night Sky, Pantheon, Ephemeris). It is an ambient
-desk instrument, read-only, LAN-only. **None of its code exists in the repo
-yet** — the `project_docs/` memory bank is the spec; treat everything in this
-section as the plan to build against, not as shipped code.
+desk instrument, read-only, LAN-only. Phase 0 data plumbing now exists in
+`api/token_oracle_api.py`; firmware, board bring-up, and rendered faces remain
+future phases. The `project_docs/` memory bank remains the visual/product spec.
 
 How it relates to what already exists:
 
@@ -188,16 +202,14 @@ How it relates to what already exists:
 - **All aggregation happens server-side on `nyx`.** The MCU only parses one
   small JSON document — never push heavy JSON or math onto the device.
 
-Two new components to build (suggested layout in `implementation-plan.md §8`,
-likely under an `api/` and `firmware/` tree):
+Components:
 
-- **Metrics API** — a FastAPI + psycopg (v3) read-only service on `nyx`,
-  co-located with Postgres and run under launchd like the sidecar. Exposes
+- **Metrics API** — an aiohttp + psycopg_pool read-only service on `nyx`,
+  co-located with Postgres and run under launchd like the sidecar. It exposes
   `GET /metrics` (the aggregated JSON document in `implementation-plan.md §4`)
-  and `GET /health`. Same-day fields aggregate from `token_usage` over the
-  local-day UTC bounds; history fields (`trend`, `high_water`, `streak_days`)
-  come from a `daily_totals` rollup (materialized view or on-the-fly while
-  volumes are small — see `implementation-plan.md §5`).
+  and `GET /health`. Same-day fields aggregate from `token_usage` over local-day
+  UTC bounds; history fields (`trend`, `high_water`, `streak_days`) are computed
+  on the fly for v1.
 - **Firmware** — ESPHome + LVGL for the Waveshare ESP32-S3-Touch-LCD-2.8C.
   Start from the verified hardware block (ST7701S 480×480 RGB panel, GT911
   touch, PCA9554 IO expander; full pin map in `implementation-plan.md §3`).
@@ -218,10 +230,8 @@ Contracts specific to the Oracle:
   (Night Sky) first.** Validate the custom-draw render path before building all
   three faces (`implementation-plan.md §6`).
 
-If the metrics API lands in this repo, it adds FastAPI + uvicorn to the runtime
-stack — these are **not** in the current dependency set (see Implementation
-Guidance below). Confirm before adding them, and keep them scoped to the API
-service so the sidecar's narrow runtime is unaffected.
+The metrics API intentionally uses the existing aiohttp/psycopg_pool stack, not
+FastAPI/uvicorn, so the sidecar's dependency footprint stays narrow.
 
 ## Development Commands
 
@@ -345,8 +355,8 @@ behavior when optional history is missing.
 - Avoid broad dependency additions. The current runtime stack is `aiohttp`,
   `click`, `httpx`, `psycopg[binary]`, `psycopg-pool`, `pyyaml`, and
   `tabulate` (plus `pytest`, `pytest-aiohttp`, `pytest-asyncio` for tests).
-  If implementing the Token Oracle metrics API, keep any new FastAPI/firmware
-  dependencies isolated from the sidecar hot path.
+  Keep any future firmware/tooling dependencies isolated from the sidecar hot
+  path.
 - Keep user-facing errors clear and local-actionable, especially for missing
   config, LM Studio downtime, and launchd state.
 - Keep the Token Oracle metrics API separate from `sidecar.py` and
@@ -390,8 +400,9 @@ behavior when optional history is missing.
 For Token Oracle work, read the `project_docs/` memory bank instead:
 
 1. `project_docs/requirements.md`
-2. `project_docs/design.md`
-3. `project_docs/implementation-plan.md`
-4. `project_docs/oracle_final.html` (open in a browser — the visual truth)
-5. `postgres_store.py` and `dashboard.py` for the existing Postgres read
+2. `project_docs/project_status.md`
+3. `project_docs/design.md`
+4. `project_docs/implementation-plan.md`
+5. `project_docs/oracle_final.html` (open in a browser — the visual truth)
+6. `postgres_store.py` and `dashboard.py` for the existing Postgres read
    patterns the metrics API can mirror.

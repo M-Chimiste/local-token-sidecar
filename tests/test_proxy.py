@@ -575,6 +575,83 @@ def test_config_central_defaults_disabled():
     assert cfg.node_id == "local"
     assert cfg.central.enabled is False
     assert cfg.central.dsn is None
+    assert cfg.oracle.enabled is False
+    assert cfg.oracle.listen_port == 8090
+    assert cfg.oracle.timezone == "America/New_York"
+    assert cfg.oracle.budget == 2_000_000
+    assert cfg.oracle.ascendant_window_seconds == 120
+    assert cfg.oracle.dsn_env == "TOKEN_SIDECAR_QUERY_DSN"
+    assert cfg.oracle.nodes == ("nyx", "mnemosyne", "athena", "metis")
+
+
+def test_config_oracle_custom_values():
+    """Oracle config is parsed into typed, validated settings."""
+    cfg = Config.from_dict({
+        "proxy": {
+            "listen_host": "localhost",
+            "listen_port": 0,
+            "upstream_url": "http://127.0.0.1:1234",
+        },
+        "database": {"path": "/tmp/tokens.db"},
+        "oracle": {
+            "enabled": True,
+            "listen_host": "127.0.0.1",
+            "listen_port": 8099,
+            "timezone": "UTC",
+            "budget": 1234,
+            "ascendant_window_seconds": 30,
+            "dsn_env": "CUSTOM_QUERY_DSN",
+            "nodes": ["nyx", "athena"],
+        },
+    })
+    assert cfg.oracle.enabled is True
+    assert cfg.oracle.listen_host == "127.0.0.1"
+    assert cfg.oracle.listen_port == 8099
+    assert cfg.oracle.timezone == "UTC"
+    assert cfg.oracle.budget == 1234
+    assert cfg.oracle.ascendant_window_seconds == 30
+    assert cfg.oracle.dsn_env == "CUSTOM_QUERY_DSN"
+    assert cfg.oracle.nodes == ("nyx", "athena")
+
+
+def test_config_oracle_rejects_bad_timezone():
+    with pytest.raises(ValueError, match="oracle.timezone"):
+        Config.from_dict({
+            "proxy": {
+                "listen_host": "localhost",
+                "listen_port": 0,
+                "upstream_url": "http://127.0.0.1:1234",
+            },
+            "database": {"path": "/tmp/tokens.db"},
+            "oracle": {"timezone": "Not/AZone"},
+        })
+
+
+def test_config_oracle_rejects_bad_numeric_values():
+    for key in ("listen_port", "budget", "ascendant_window_seconds"):
+        with pytest.raises(ValueError, match=f"oracle.{key}"):
+            Config.from_dict({
+                "proxy": {
+                    "listen_host": "localhost",
+                    "listen_port": 0,
+                    "upstream_url": "http://127.0.0.1:1234",
+                },
+                "database": {"path": "/tmp/tokens.db"},
+                "oracle": {key: 0},
+            })
+
+
+def test_config_oracle_rejects_duplicate_nodes():
+    with pytest.raises(ValueError, match="duplicate"):
+        Config.from_dict({
+            "proxy": {
+                "listen_host": "localhost",
+                "listen_port": 0,
+                "upstream_url": "http://127.0.0.1:1234",
+            },
+            "database": {"path": "/tmp/tokens.db"},
+            "oracle": {"nodes": ["nyx", "nyx"]},
+        })
 
 
 def test_config_central_requires_node_id(monkeypatch):

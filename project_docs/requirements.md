@@ -2,7 +2,7 @@
 
 > Memory Bank · `requirements.md`
 > Project codename: **Token Oracle** · Theme: **The Pantheon**
-> Status: design locked, pre-implementation
+> Status: design locked; Phase 0 data plumbing implemented in this repo
 
 ---
 

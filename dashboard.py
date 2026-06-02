@@ -20,23 +20,23 @@ Routes are documented inline below and in project_docs/dashboard.md.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import pathlib
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo, available_timezones
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
 from config_loader import Config, load_config, parse_cli_args
-
-
-# Cache the IANA timezone whitelist once at import — used to validate the
-# `tz` query parameter before passing it through to Postgres `AT TIME ZONE`.
-_VALID_TIMEZONES = available_timezones()
+from pg_common import (
+    PROBE_FILTER_SQL,
+    iso_utc,
+    json_response,
+    validate_timezone,
+)
 
 
 logger = logging.getLogger("dashboard")
@@ -61,14 +61,6 @@ _TOP_LEVEL_STATIC = {
 # ---------------------------------------------------------------------------
 # SQL helpers
 # ---------------------------------------------------------------------------
-
-# Applied to every analytics query. NULL-safe so older rows without an
-# `endpoint` value still pass through.
-PROBE_FILTER_SQL = (
-    " COALESCE(endpoint, '') <> '/probe'"
-    " AND COALESCE(model, '')    <> 'probe'"
-    " AND event_id NOT LIKE 'permission-probe-%%'"
-)
 
 VALID_RANGES = ("1d", "7d", "30d", "all")
 VALID_GRAN = ("hour", "day", "week")
@@ -182,31 +174,16 @@ def _parse_tz(request: web.Request) -> str:
     whitelist. Defaults to 'UTC' when missing. Rejects unknown values so
     arbitrary strings never reach Postgres `AT TIME ZONE`.
     """
-    tz = (request.query.get("tz") or "UTC").strip() or "UTC"
-    if tz not in _VALID_TIMEZONES:
-        raise web.HTTPBadRequest(reason=f"unknown tz: {tz!r}")
-    return tz
+    return validate_timezone(request.query.get("tz") or "UTC")
 
 
 def _iso(ts: datetime) -> str:
     """Render a UTC timestamptz as ISO with trailing 'Z'."""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return iso_utc(ts)
 
 
 def _json(payload: Any, status: int = 200) -> web.Response:
-    return web.Response(
-        body=json.dumps(payload, default=_json_default).encode(),
-        status=status,
-        content_type="application/json",
-    )
-
-
-def _json_default(obj: Any) -> Any:
-    if isinstance(obj, datetime):
-        return _iso(obj)
-    raise TypeError(f"not serializable: {type(obj).__name__}")
+    return json_response(payload, status)
 
 
 # ---------------------------------------------------------------------------
