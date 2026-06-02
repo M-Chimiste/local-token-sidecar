@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Token Oracle — the Pantheon</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600&family=Cormorant:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{--gold:#c9a24b;--gb:#f3da94;--gd:#6f5a2e;--pat:#46c2a6;--txd:#9a8f6b;}
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{background:radial-gradient(circle at 50% 32%,#12121e 0%,#070710 55%,#020206 100%);
+    color:var(--gold);font-family:'Cormorant',Georgia,serif;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;min-height:100vh;gap:20px;padding:30px 14px;-webkit-font-smoothing:antialiased;}
+  .device{position:relative;width:min(480px,92vw);aspect-ratio:1/1;border-radius:50%;cursor:pointer;user-select:none;
+    -webkit-tap-highlight-color:transparent;padding:11px;
+    background:conic-gradient(from 215deg,#2a2317,#6e5a30,#c9a24b,#7a6433,#2a2317,#5a4a28,#b89546,#2a2317);
+    box-shadow:0 24px 60px rgba(0,0,0,.7),0 2px 0 rgba(243,218,148,.15),inset 0 0 8px rgba(0,0,0,.6);}
+  .glass{position:relative;width:100%;height:100%;border-radius:50%;overflow:hidden;
+    background:radial-gradient(circle at 50% 40%,#0a0c1a 0%,#05060f 60%,#020207 100%);
+    box-shadow:inset 0 0 60px rgba(0,0,0,.92),inset 0 2px 22px rgba(243,218,148,.05);}
+  .glass::after{content:"";position:absolute;inset:0;border-radius:50%;pointer-events:none;mix-blend-mode:screen;
+    background:radial-gradient(120% 80% at 32% 12%,rgba(255,255,255,.05),transparent 46%);}
+  .face{position:absolute;inset:0;opacity:0;transition:opacity .55s ease;pointer-events:none}
+  .face.active{opacity:1}
+  svg{width:100%;height:100%;display:block}
+  .dots{display:flex;gap:11px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--gd);transition:.35s;cursor:pointer}
+  .dot.on{background:var(--gb);box-shadow:0 0 9px var(--gold)}
+  .caption{font-family:'Cinzel',serif;font-size:12px;letter-spacing:.34em;color:var(--gold);text-transform:uppercase}
+  .hint{font-family:'Cormorant',serif;font-style:italic;font-size:14px;color:var(--txd)}
+</style>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute"><defs>
+    <radialGradient id="grad" gradientUnits="userSpaceOnUse" cx="240" cy="240" r="210">
+      <stop offset="0" stop-color="#7a6330"/><stop offset="0.6" stop-color="#c9a24b"/><stop offset="1" stop-color="#f3da94"/></radialGradient>
+    <radialGradient id="nyxGlow"><stop offset="0" stop-color="#fff7e0" stop-opacity="0.9"/><stop offset="40%" stop-color="#f3da94" stop-opacity="0.5"/><stop offset="100%" stop-color="#f3da94" stop-opacity="0"/></radialGradient>
+    <radialGradient id="milky" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#8a8fc0" stop-opacity="0.10"/><stop offset="100%" stop-color="#8a8fc0" stop-opacity="0"/></radialGradient>
+    <radialGradient id="moonGlow"><stop offset="0" stop-color="#fff7e0" stop-opacity="0.55"/><stop offset="60%" stop-color="#f3da94" stop-opacity="0.12"/><stop offset="100%" stop-color="#f3da94" stop-opacity="0"/></radialGradient>
+    <radialGradient id="moonFace" cx="38%" cy="36%" r="70%"><stop offset="0" stop-color="#fdf4d8"/><stop offset="70%" stop-color="#e6cf8e"/><stop offset="100%" stop-color="#c9a24b"/></radialGradient>
+    <linearGradient id="trail" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="100%" stop-color="#fff" stop-opacity="0.9"/></linearGradient>
+    <filter id="glow" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="2.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="big" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="5.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs></svg>
+
+  <div class="device" id="device">
+    <div class="glass">
+      <div class="face" id="f0"><svg viewBox="0 0 480 480"></svg></div>
+      <div class="face" id="f1"><svg viewBox="0 0 480 480"></svg></div>
+      <div class="face" id="f2"><svg viewBox="0 0 480 480"></svg></div>
+    </div>
+  </div>
+  <div class="dots" id="dots"></div>
+  <div class="caption" id="cap"></div>
+  <div class="hint">tap to turn the face — left edge to go back</div>
+
+<script>
+const NS='http://www.w3.org/2000/svg',C=240,D=Math.PI/180;
+const GOLD='#c9a24b',GB='#f3da94',GD='#6f5a2e',GF='rgba(201,162,75,0.13)',GT='rgba(201,162,75,0.10)',PAT='#46c2a6',PALE='#a8ecdb',TXD='#9a8f6b';
+const TODAY=1295000, BUDGET=2000000;
+const fmt=v=>v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?Math.round(v/1e3)+'K':''+v;
+const pt=(r,deg)=>{const a=(deg-90)*D;return [C+r*Math.cos(a),C+r*Math.sin(a)];};
+const rnd=(a,b)=>a+Math.random()*(b-a);
+function E(t,a){const e=document.createElementNS(NS,t);for(const k in a)if(a[k]!=null)e.setAttribute(k,a[k]);return e;}
+function add(p,t,a){const e=E(t,a);p.appendChild(e);return e;}
+function T(p,x,y,str,{s=12,f=GOLD,anc='middle',fam='cinzel',ls='.2em',w=400}={}){
+  const e=E('text',{x,y,'font-size':s,fill:f,'text-anchor':anc,'font-weight':w,
+    'font-family':fam==='cinzel'?"'Cinzel',serif":"'Cormorant',Georgia,serif",'letter-spacing':fam==='cinzel'?ls:0});
+  e.textContent=str;p.appendChild(e);return e;}
+function arc(r,a0,a1,w,stroke,filter){const[x0,y0]=pt(r,a0),[x1,y1]=pt(r,a1),lg=(a1-a0)>180?1:0;
+  return E('path',{d:`M ${x0} ${y0} A ${r} ${r} 0 ${lg} 1 ${x1} ${y1}`,fill:'none',stroke,'stroke-width':w,'stroke-linecap':'round',filter});}
+function ring(p,r,st=GF,w=1){add(p,'circle',{cx:C,cy:C,r,fill:'none',stroke:st,'stroke-width':w});}
+function smil(p,attr,vals,dur,ex={}){add(p,'animate',Object.assign({attributeName:attr,values:vals,dur,repeatCount:'indefinite'},ex));}
+function spin(g,cx,cy,dur){add(g,'animateTransform',{attributeName:'transform',type:'rotate',from:`0 ${cx} ${cy}`,to:`360 ${cx} ${cy}`,dur,repeatCount:'indefinite'});}
+function countUp(n,t,d=1200,suf=''){const t0=performance.now();(function s(x){const k=Math.min(1,(x-t0)/d),e=1-Math.pow(1-k,3);n.textContent=fmt(Math.round(t*e))+suf;if(k<1)requestAnimationFrame(s);})(t0);}
+function drawIn(p,d=.9,dl=0){const L=p.getTotalLength();p.style.transition='none';p.style.strokeDasharray=L;p.style.strokeDashoffset=L;p.getBoundingClientRect();
+  setTimeout(()=>{p.style.transition=`stroke-dashoffset ${d}s cubic-bezier(.2,.7,.3,1)`;p.style.strokeDashoffset=0;},dl);}
+
+/* ---- sigils ---- */
+function sigil(p,kind,x,y,s,col){const g=add(p,'g',{});
+  if(kind==='nyx'){
+    add(g,'path',{d:`M ${x} ${y-s} A ${s} ${s} 0 1 0 ${x} ${y+s} A ${s*0.74} ${s*0.74} 0 1 1 ${x} ${y-s} Z`,fill:col});
+    const sx=x+s*0.9,sy=y-s*0.8,t=s*0.42;
+    add(g,'path',{d:`M ${sx} ${sy-t} L ${sx+t*0.3} ${sy-t*0.3} L ${sx+t} ${sy} L ${sx+t*0.3} ${sy+t*0.3} L ${sx} ${sy+t} L ${sx-t*0.3} ${sy+t*0.3} L ${sx-t} ${sy} L ${sx-t*0.3} ${sy-t*0.3} Z`,fill:col});
+  }else if(kind==='waves'){for(let i=0;i<3;i++){const yy=y-s*0.6+i*s*0.6;
+    add(g,'path',{d:`M ${x-s} ${yy} q ${s*0.5} ${-s*0.5} ${s} 0 t ${s} 0`,fill:'none',stroke:col,'stroke-width':1.6,'stroke-linecap':'round'});}
+  }else if(kind==='aegis'){
+    add(g,'path',{d:`M ${x} ${y-s} L ${x+s*0.82} ${y-s*0.45} L ${x+s*0.66} ${y+s*0.5} Q ${x} ${y+s*1.05} ${x} ${y+s*1.05} Q ${x} ${y+s*1.05} ${x-s*0.66} ${y+s*0.5} L ${x-s*0.82} ${y-s*0.45} Z`,fill:'none',stroke:col,'stroke-width':1.6});
+    add(g,'circle',{cx:x,cy:y,r:s*0.2,fill:col});
+  }else if(kind==='spiral'){let d='M '+x+' '+y;for(let i=0;i<=44;i++){const t=i/44,a=t*2.6*360,r=t*s;d+=` L ${x+r*Math.cos(a*D)} ${y+r*Math.sin(a*D)}`;}
+    add(g,'path',{d,fill:'none',stroke:col,'stroke-width':1.5,'stroke-linecap':'round'});}
+  return g;}
+
+/* ---- stars / sky ---- */
+function star(p,x,y,r,col,{glow=false,twinkle=false,sparkle=false}={}){const g=add(p,'g',{});
+  if(glow)add(g,'circle',{cx:x,cy:y,r:r*3.4,fill:'url(#nyxGlow)'});
+  const c=add(g,'circle',{cx:x,cy:y,r,fill:col,filter:glow?'url(#big)':null});
+  if(sparkle){const t=r*2.4;add(g,'path',{d:`M ${x} ${y-t} L ${x+t*0.16} ${y-t*0.16} L ${x+t} ${y} L ${x+t*0.16} ${y+t*0.16} L ${x} ${y+t} L ${x-t*0.16} ${y+t*0.16} L ${x-t} ${y} L ${x-t*0.16} ${y-t*0.16} Z`,fill:col,opacity:.9});}
+  if(twinkle)smil(c,'opacity',`${rnd(.55,.8)};1;${rnd(.55,.8)}`,rnd(2.2,4.6)+'s',{begin:rnd(0,3)+'s'});
+  return g;}
+function constellation(svg,stars,edges,{color,line,ascendant=false}){const g=add(svg,'g',{});
+  edges.forEach(([a,b])=>add(g,'line',{x1:stars[a].x,y1:stars[a].y,x2:stars[b].x,y2:stars[b].y,stroke:line,'stroke-width':ascendant?1.1:0.8,opacity:0}));
+  [...g.children].forEach((ln,i)=>setTimeout(()=>{ln.style.transition='opacity 1s';ln.setAttribute('opacity',ascendant?.55:.32);},500+i*70));
+  stars.forEach((s,i)=>{const r=1.7+s.mag*2.6+(s.anchor?1:0);
+    const st=star(g,s.x,s.y,r,color,{glow:s.anchor||ascendant,twinkle:true,sparkle:s.anchor});
+    st.style.opacity=0;st.style.transition='opacity .6s';setTimeout(()=>st.style.opacity=1,300+i*90);
+    if(ascendant&&s.anchor)smil(st.querySelector('circle'),'r',`${r};${r+1.4};${r}`,'2.4s');});}
+function background(svg,n){const f=add(svg,'g',{});
+  for(let i=0;i<n;i++){const ang=rnd(0,360),rad=Math.sqrt(Math.random())*224,x=C+rad*Math.cos(ang*D),y=C+rad*Math.sin(ang*D);
+    const c=add(f,'circle',{cx:x,cy:y,r:rnd(.4,1.5),fill:Math.random()<.2?'#cfe0ff':'#f3eccf',opacity:rnd(.18,.7)});
+    if(Math.random()<.3)smil(c,'opacity',`${rnd(.15,.4)};${rnd(.6,.9)};${rnd(.15,.4)}`,rnd(2.5,6)+'s',{begin:rnd(0,4)+'s'});}
+  add(f,'animateTransform',{attributeName:'transform',type:'rotate',from:`0 ${C} ${C}`,to:`360 ${C} ${C}`,dur:'280s',repeatCount:'indefinite'});return f;}
+function shootingStar(svg,delay){const g=add(svg,'g',{opacity:0});
+  const x0=rnd(80,150),y0=rnd(80,140);
+  add(g,'line',{x1:0,y1:0,x2:46,y2:0,stroke:'url(#trail)','stroke-width':1.6,'stroke-linecap':'round'});
+  add(g,'circle',{cx:46,cy:0,r:1.6,fill:'#fff'});
+  g.setAttribute('transform',`translate(${x0} ${y0}) rotate(28)`);
+  smil(g,'opacity','0;0;0.9;0','9s',{begin:delay+'s',keyTimes:'0;0.75;0.82;0.95'});}
+
+/* ===================== FACE 1 — THE NIGHT SKY ===================== */
+function chart(svg){
+  add(svg,'ellipse',{cx:230,cy:250,rx:250,ry:120,fill:'url(#milky)',transform:'rotate(-28 230 250)',filter:'url(#big)'});
+  background(svg,96); shootingStar(svg,1.2);
+  [70,128,188].forEach(r=>add(svg,'circle',{cx:C,cy:C,r,fill:'none',stroke:'rgba(201,162,75,0.09)','stroke-width':1}));
+  const mne=[{x:118,y:96,mag:.5},{x:150,y:120,mag:.6},{x:128,y:154,mag:.5},{x:170,y:150,mag:.7},{x:188,y:188,mag:.6},{x:214,y:178,mag:1,anchor:true}];
+  constellation(svg,mne,[[0,1],[1,2],[2,3],[3,4],[4,5]],{color:PALE,line:'rgba(70,194,166,0.6)',ascendant:true});
+  T(svg,104,80,'MNEMOSYNE',{s:11,f:PAT,anc:'start'}); T(svg,104,98,'690K',{s:17,f:GB,fam:'corm',anc:'start',w:600});
+  const ath=[{x:356,y:158,mag:.7},{x:392,y:194,mag:.6},{x:374,y:236,mag:1,anchor:true},{x:330,y:246,mag:.6},{x:316,y:204,mag:.7}];
+  constellation(svg,ath,[[0,1],[1,2],[2,3],[3,4],[4,0]],{color:GB,line:'rgba(243,218,148,0.22)'});
+  T(svg,376,140,'ATHENA',{s:11,f:GOLD,anc:'end'}); T(svg,376,158,'318K',{s:16,f:GB,fam:'corm',anc:'end',w:600});
+  const met=[{x:118,y:316,mag:.6},{x:150,y:330,mag:.7},{x:146,y:366,mag:1,anchor:true},{x:108,y:368,mag:.5},{x:92,y:336,mag:.6}];
+  constellation(svg,met,[[0,1],[1,2],[2,3],[3,4]],{color:GB,line:'rgba(243,218,148,0.22)'});
+  T(svg,86,300,'METIS',{s:11,f:GOLD,anc:'start'}); T(svg,86,318,'212K',{s:16,f:GB,fam:'corm',anc:'start',w:600});
+  star(svg,C,C,3.4,'#fff7e0',{glow:true,sparkle:true});
+  smil(svg.lastChild.querySelector('circle'),'opacity','0.8;1;0.8','3.4s');
+  add(svg,'path',{d:`M ${C+12} ${C-9} A 7 7 0 1 0 ${C+12} ${C+5} A 5.2 5.2 0 1 1 ${C+12} ${C-9} Z`,fill:GB,opacity:.9});
+  T(svg,C,C+30,'NYX',{s:10,f:TXD,ls:'.3em'});
+  const h=T(svg,C,C+56,'0',{s:30,f:GB,fam:'corm',w:600});h.setAttribute('filter','url(#glow)');
+  T(svg,C,C+74,'TRIBUTE GATHERED',{s:8,f:TXD,ls:'.26em'}); countUp(h,TODAY,1300);
+}
+
+/* ===================== FACE 2 — THE PANTHEON (rings) ===================== */
+const NYX={n:'NYX',sig:'nyx',own:75000};
+const GODS=[{n:'MNEMOSYNE',dom:'MEMORY',sig:'waves',t:690000,live:true,r:198},
+  {n:'ATHENA',dom:'WISDOM',sig:'aegis',t:318000,r:158},{n:'METIS',dom:'COUNSEL',sig:'spiral',t:212000,r:118}];
+const MAXT=690000;
+function pantheon(svg){
+  GODS.forEach(g=>ring(svg,g.r,GT,1)); ring(svg,222,GF);
+  GODS.forEach((g,i)=>{const a0=-78,sweep=Math.min((g.t/MAXT)*306,306),end=a0+sweep;
+    const p=arc(g.r,a0,end-0.01,7,g.live?PAT:'url(#grad)',g.live?'url(#glow)':null); svg.appendChild(p); drawIn(p,1.0,150+i*180);
+    const [ox,oy]=pt(g.r,end);
+    if(g.live){const rays=add(svg,'g',{});for(let k=0;k<12;k++){const ang=k*30,[rx1,ry1]=[ox+9*Math.cos(ang*D),oy+9*Math.sin(ang*D)],[rx2,ry2]=[ox+17*Math.cos(ang*D),oy+17*Math.sin(ang*D)];
+      add(rays,'line',{x1:rx1,y1:ry1,x2:rx2,y2:ry2,stroke:PAT,'stroke-width':1,opacity:.6});}spin(rays,ox,oy,'26s');}
+    const orb=add(svg,'circle',{cx:ox,cy:oy,r:g.live?9:6.5,fill:g.live?PAT:GB,filter:g.live?'url(#glow)':null});
+    if(g.live)smil(orb,'r','8;10.5;8','2.4s');
+    const [lx,ly]=pt(g.r+22,end),anc=(end%360)>180?'end':'start';
+    sigil(svg,g.sig,lx+(anc==='end'?-2:2),ly-26,6.5,g.live?PAT:GOLD);
+    T(svg,lx,ly-12,g.n,{s:12,f:g.live?PAT:GOLD,anc});
+    T(svg,lx,ly+8,fmt(g.t),{s:18,f:GB,fam:'corm',anc,w:600});
+    T(svg,lx,ly+22,g.dom,{s:8,f:GD,anc,ls:'.3em'});});
+  add(svg,'circle',{cx:C,cy:C,r:54,fill:'#070810',opacity:.9});
+  const nyxSig=sigil(svg,'nyx',C-4,222,9,GB); smil(nyxSig,'opacity','1;0.55;1','3.6s');
+  const h=T(svg,C,266,'0',{s:42,f:GB,fam:'corm',w:600});h.setAttribute('filter','url(#big)');
+  T(svg,C,286,'TRIBUTE GATHERED',{s:9,f:TXD,ls:'.28em'});
+  T(svg,C,418,'NYX KEEPS THE RECORD · 75K',{s:9,f:GD,ls:'.24em'}); countUp(h,TODAY,1200);
+}
+
+/* ===================== FACE 3 — THE EPHEMERIS ===================== */
+function moon(svg,cx,cy,R,illum){
+  add(svg,'circle',{cx,cy,r:R*2.1,fill:'url(#moonGlow)'});
+  add(svg,'circle',{cx,cy,r:R,fill:'#14151f',stroke:'rgba(201,162,75,0.3)','stroke-width':1});
+  if(illum>0.5){add(svg,'circle',{cx,cy,r:R,fill:'url(#moonFace)'});const rx=R*(2*illum-1);
+    add(svg,'path',{d:`M ${cx} ${cy-R} A ${R} ${R} 0 0 0 ${cx} ${cy+R} A ${rx} ${R} 0 0 1 ${cx} ${cy-R} Z`,fill:'#14151f',opacity:.92});
+  }else{const rx=R*(1-2*illum);
+    add(svg,'path',{d:`M ${cx} ${cy-R} A ${R} ${R} 0 0 1 ${cx} ${cy+R} A ${rx} ${R} 0 0 0 ${cx} ${cy-R} Z`,fill:'url(#moonFace)'});}
+  [[R*0.4,-R*0.3,R*0.13],[R*0.2,R*0.35,R*0.09],[R*0.55,R*0.1,R*0.07]].forEach(([dx,dy,cr])=>add(svg,'circle',{cx:cx+dx,cy:cy+dy,r:cr,fill:'rgba(120,96,40,0.35)'}));
+}
+function reading(svg,x,y,anc,label,value,{vf=GB}={}){const mx=anc==='end'?x+8:x-8;
+  add(svg,'path',{d:`M ${mx} ${y-15} l1.4 4 4 .4 -3 2.8 1 4 -3.4-2.2 -3.4 2.2 1-4 -3-2.8 4-.4 Z`,fill:GD});
+  T(svg,x,y-8,label,{s:9,f:TXD,anc,ls:'.24em'});
+  T(svg,x,y+12,value,{s:vf===GB?17:15,f:vf,anc,fam:'corm',w:600,ls:0});}
+function ephemeris(svg){
+  background(svg,60);
+  for(let i=0;i<60;i++){const deg=i*6,maj=i%5===0,a=(deg-90)*D,r1=maj?212:216,r2=222;
+    add(svg,'line',{x1:C+r1*Math.cos(a),y1:C+r1*Math.sin(a),x2:C+r2*Math.cos(a),y2:C+r2*Math.sin(a),stroke:maj?'rgba(201,162,75,0.5)':'rgba(201,162,75,0.22)','stroke-width':maj?1.4:0.8});}
+  T(svg,C,52,'EPHEMERIS',{s:15,f:GOLD,ls:'.4em'}); T(svg,C,72,'II · JUNE · MMXXVI',{s:10,f:GD,ls:'.32em'});
+  moon(svg,C,190,46,0.72);
+  const h=T(svg,C,272,'0',{s:46,f:GB,fam:'corm',w:600});h.setAttribute('filter','url(#big)');
+  T(svg,C,292,'TRIBUTE GATHERED',{s:9,f:TXD,ls:'.28em'});
+  T(svg,C,316,'WAXING  ·  +18% ABOVE THE MEAN',{s:10,f:PAT,ls:'.18em'}); countUp(h,TODAY,1300);
+  reading(svg,118,150,'start','INVOCATIONS','1,284');
+  reading(svg,362,150,'end','ZENITH','14·00 — 248K');
+  reading(svg,104,250,'start','BALANCE','1.68 : 1');
+  reading(svg,376,250,'end','REIGNING','MNEMOSYNE',{vf:PAT});
+  reading(svg,150,360,'start','DAWN → DUSK','06·42 → 14·31');
+  reading(svg,330,360,'end','HIGH-WATER','1.84M');
+}
+
+/* ===================== nav ===================== */
+const FACES=[{id:'f0',name:'The Night Sky',build:chart},{id:'f1',name:'The Pantheon',build:pantheon},{id:'f2',name:'The Ephemeris',build:ephemeris}];
+const dots=document.getElementById('dots');
+FACES.forEach((f,i)=>{const d=document.createElement('span');d.className='dot';d.onclick=e=>{e.stopPropagation();show(i);};dots.appendChild(d);});
+let cur=-1;
+function show(i){const f=FACES[i],svg=document.getElementById(f.id).querySelector('svg');svg.innerHTML='';f.build(svg);
+  FACES.forEach((g,n)=>document.getElementById(g.id).classList.toggle('active',n===i));
+  [...dots.children].forEach((d,n)=>d.classList.toggle('on',n===i));
+  document.getElementById('cap').textContent=f.name;cur=i;}
+document.getElementById('device').addEventListener('click',e=>{const r=e.currentTarget.getBoundingClientRect();
+  show((cur+((e.clientX-r.left)<r.width*0.28?FACES.length-1:1))%FACES.length);});
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')show((cur+1)%FACES.length);if(e.key==='ArrowLeft')show((cur+FACES.length-1)%FACES.length);});
+show(0);
+</script>
+</body>
+</html>
