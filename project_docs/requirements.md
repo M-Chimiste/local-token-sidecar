@@ -136,7 +136,6 @@ high-water mark (record day). Requires a `daily_totals` rollup in Postgres.
 
 - `node_id` is the node column name (confirm against the live schema; configurable).
 - Timestamps are UTC; "today" is computed in a configurable local timezone.
-- Daily budget for any progress framing is configurable (default 2,000,000 tokens).
 - ESPHome ≥ 2024.6 assumed (http_request `on_response` + `json::parse_json` shape).
 
 ## 11. Open Questions (carry into build)

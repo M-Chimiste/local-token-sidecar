@@ -224,8 +224,7 @@ Contracts specific to the Oracle:
 - **Verdigris (`#46c2a6`) is reserved exclusively for "ascendant / alive"** —
   the node generating right now. Gold is the default world; never use verdigris
   decoratively. This is the single most load-bearing visual rule.
-- Timestamps are UTC; "today" is computed in a configured local timezone. The
-  daily budget for progress framing is configurable (default 2,000,000 tokens).
+- Timestamps are UTC; "today" is computed in a configured local timezone.
 - Build order is deliberate: **data plumbing → board bring-up → hardest face
   (Night Sky) first.** Validate the custom-draw render path before building all
   three faces (`implementation-plan.md §6`).

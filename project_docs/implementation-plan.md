@@ -44,7 +44,7 @@ touchscreen gt911:
 esp32: board esp32-s3-devkitc-1, flash 8MB, framework esp-idf, psram octal@80MHz
 ```
 
-> Only `substitutions` (nyx LAN IP, budget, accent) and Wi-Fi `secrets` should
+> Only `substitutions` (nyx LAN IP, accent) and Wi-Fi `secrets` should
 > need editing. Flash once over USB, then OTA.
 
 ## 4. API Contract
@@ -55,7 +55,6 @@ esp32: board esp32-s3-devkitc-1, flash 8MB, framework esp-idf, psram octal@80MHz
 {
   "ok": true,
   "ts": "2026-06-02T14:31:00Z",
-  "budget": 2000000,
   "today":   { "total": 1295000, "prompt": 812000, "completion": 483000, "requests": 1284 },
   "rate_per_min": 412,
   "ascendant": "mnemosyne",                 // node with activity in the recency window

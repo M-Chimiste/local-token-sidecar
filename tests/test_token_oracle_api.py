@@ -219,13 +219,12 @@ async def test_metrics_returns_expected_shape_and_values(client):
     j = await r.json()
 
     assert set(j) == {
-        "ok", "ts", "budget", "today", "rate_per_min", "ascendant",
+        "ok", "ts", "today", "rate_per_min", "ascendant",
         "zenith", "span", "models", "nodes", "hourly", "trend",
         "high_water", "streak_days",
     }
     assert j["ok"] is True
     assert j["ts"] == "2026-06-02T14:31:00Z"
-    assert j["budget"] == 2_000_000
     assert j["today"] == {"total": 1100, "prompt": 710, "completion": 390, "requests": 4}
     assert j["rate_per_min"] == 150
     assert j["ascendant"] == "mnemosyne"

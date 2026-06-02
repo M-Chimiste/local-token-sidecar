@@ -50,8 +50,8 @@ Recommended deployment gate:
 - `pg_common.py`: shared probe filtering, JSON response, UTC ISO formatting,
   timezone validation, and simple env-file DSN lookup.
 - `config_loader.py`: `OracleConfig` with defaults:
-  `0.0.0.0:8090`, `America/New_York`, `budget=2000000`,
-  `ascendant_window_seconds=120`, `dsn_env=TOKEN_SIDECAR_QUERY_DSN`, and stable
+  `0.0.0.0:8090`, `America/New_York`, `ascendant_window_seconds=120`,
+  `dsn_env=TOKEN_SIDECAR_QUERY_DSN`, and stable
   nodes `nyx`, `mnemosyne`, `athena`, `metis`.
 - `setup_launchd.py --service oracle`: label `com.athena.token-oracle-api`,
   env-file sourcing, preflight checks, and logs under `~/.token_sidecar/`.
@@ -100,6 +100,8 @@ integration.
   dependencies and mirror `dashboard.py`.
 - Added launchd support for `com.athena.token-oracle-api`.
 - Added config, API, shared-helper, dashboard, and launchd tests.
+- Removed the stale Oracle progress-limit config/API field; `/metrics` is
+  token-only aggregate data with no quota value.
 - Updated README, AGENTS/CLAUDE, implementation plan, requirements, and root
   project status.
 - Full test suite passed: **157 passed, 2 skipped**.

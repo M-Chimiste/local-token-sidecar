@@ -265,7 +265,6 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
     return {
         "ok": True,
         "ts": iso_utc(now),
-        "budget": cfg.budget,
         "today": {
             "total": today_total,
             "prompt": int(prompt or 0),
@@ -294,7 +293,6 @@ def default_metrics(cfg: OracleConfig, now: datetime, ok: bool) -> dict[str, Any
     return {
         "ok": ok,
         "ts": iso_utc(now),
-        "budget": cfg.budget,
         "today": {"total": 0, "prompt": 0, "completion": 0, "requests": 0},
         "rate_per_min": 0,
         "ascendant": None,

@@ -60,7 +60,7 @@
 <script>
 const NS='http://www.w3.org/2000/svg',C=240,D=Math.PI/180;
 const GOLD='#c9a24b',GB='#f3da94',GD='#6f5a2e',GF='rgba(201,162,75,0.13)',GT='rgba(201,162,75,0.10)',PAT='#46c2a6',PALE='#a8ecdb',TXD='#9a8f6b';
-const TODAY=1295000, BUDGET=2000000;
+const TODAY=1295000;
 const fmt=v=>v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?Math.round(v/1e3)+'K':''+v;
 const pt=(r,deg)=>{const a=(deg-90)*D;return [C+r*Math.cos(a),C+r*Math.sin(a)];};
 const rnd=(a,b)=>a+Math.random()*(b-a);

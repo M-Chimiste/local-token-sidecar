@@ -97,7 +97,6 @@ All settings live in `config.yaml` at the project root.
 | `oracle.listen_host` | string | `"0.0.0.0"` | Interface the Token Oracle metrics API binds to |
 | `oracle.listen_port` | int | `8090` | Port for the Token Oracle metrics API |
 | `oracle.timezone` | string | `"America/New_York"` | IANA timezone used for local-day metrics |
-| `oracle.budget` | int | `2000000` | Daily token budget surfaced in `/metrics` |
 | `oracle.ascendant_window_seconds` | int | `120` | Recency window for live/ascendant detection |
 | `oracle.dsn_env` | string | `"TOKEN_SIDECAR_QUERY_DSN"` | Env var containing the read-side Postgres DSN |
 | `oracle.nodes` | list | `nyx,mnemosyne,athena,metis` | Stable node order for zero-filled `/metrics` output |

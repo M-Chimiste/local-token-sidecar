@@ -9,9 +9,9 @@ Build Phase 0 as a separate read-only aiohttp service in the current repo. It wi
   - Share UTC ISO `Z` formatting and JSON response helper behavior.
   - Share IANA timezone validation using `zoneinfo.available_timezones()` cached at import, matching dashboard behavior.
 - Add an `oracle` config section and frozen config dataclasses:
-  - Defaults: `enabled: false`, `listen_host: "0.0.0.0"`, `listen_port: 8090`, `timezone: "America/New_York"`, `budget: 2000000`, `ascendant_window_seconds: 120`, `dsn_env: "TOKEN_SIDECAR_QUERY_DSN"`.
+  - Defaults: `enabled: false`, `listen_host: "0.0.0.0"`, `listen_port: 8090`, `timezone: "America/New_York"`, `ascendant_window_seconds: 120`, `dsn_env: "TOKEN_SIDECAR_QUERY_DSN"`.
   - Add configured node mapping in this order: `nyx`, `mnemosyne`, `athena`, `metis`.
-  - Validate timezone and require positive budget/window/port.
+  - Validate timezone and require positive window/port.
 - Add `api/token_oracle_api.py` as an aiohttp app:
   - `create_app(cfg, pool_factory=None)` mirrors `dashboard.py` so tests can inject a fake pool.
   - `GET /health` returns `{"status":"ok"}` without touching Postgres.

@@ -72,7 +72,6 @@ class OracleConfig:
         listen_host:               Bind address (default "0.0.0.0").
         listen_port:               TCP port (default 8090).
         timezone:                  IANA timezone used for local-day metrics.
-        budget:                    Daily token budget surfaced in /metrics.
         ascendant_window_seconds:  Recency window for "alive" node detection.
         dsn_env:                   Env var containing the read-side Postgres DSN.
         nodes:                     Stable node/god order for zero-filled output.
@@ -82,7 +81,6 @@ class OracleConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 8090
     timezone: str = "America/New_York"
-    budget: int = 2_000_000
     ascendant_window_seconds: int = 120
     dsn_env: str = "TOKEN_SIDECAR_QUERY_DSN"
     nodes: tuple[str, ...] = DEFAULT_ORACLE_NODES
@@ -258,15 +256,12 @@ def _as_bool(value) -> bool:
 def _oracle_from_dict(raw: dict) -> OracleConfig:
     """Build and validate Token Oracle metrics API config."""
     listen_port = int(raw.get("listen_port", 8090))
-    budget = int(raw.get("budget", 2_000_000))
     window = int(raw.get("ascendant_window_seconds", 120))
     timezone = str(raw.get("timezone", "America/New_York"))
     nodes = _as_nodes(raw.get("nodes", DEFAULT_ORACLE_NODES))
 
     if listen_port <= 0:
         raise ValueError("oracle.listen_port must be > 0.")
-    if budget <= 0:
-        raise ValueError("oracle.budget must be > 0.")
     if window <= 0:
         raise ValueError("oracle.ascendant_window_seconds must be > 0.")
     if not is_valid_timezone(timezone):
@@ -279,7 +274,6 @@ def _oracle_from_dict(raw: dict) -> OracleConfig:
         listen_host=str(raw.get("listen_host", "0.0.0.0")),
         listen_port=listen_port,
         timezone=timezone,
-        budget=budget,
         ascendant_window_seconds=window,
         dsn_env=str(raw.get("dsn_env", "TOKEN_SIDECAR_QUERY_DSN")),
         nodes=nodes,

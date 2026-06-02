@@ -578,7 +578,6 @@ def test_config_central_defaults_disabled():
     assert cfg.oracle.enabled is False
     assert cfg.oracle.listen_port == 8090
     assert cfg.oracle.timezone == "America/New_York"
-    assert cfg.oracle.budget == 2_000_000
     assert cfg.oracle.ascendant_window_seconds == 120
     assert cfg.oracle.dsn_env == "TOKEN_SIDECAR_QUERY_DSN"
     assert cfg.oracle.nodes == ("nyx", "mnemosyne", "athena", "metis")
@@ -598,7 +597,6 @@ def test_config_oracle_custom_values():
             "listen_host": "127.0.0.1",
             "listen_port": 8099,
             "timezone": "UTC",
-            "budget": 1234,
             "ascendant_window_seconds": 30,
             "dsn_env": "CUSTOM_QUERY_DSN",
             "nodes": ["nyx", "athena"],
@@ -608,7 +606,6 @@ def test_config_oracle_custom_values():
     assert cfg.oracle.listen_host == "127.0.0.1"
     assert cfg.oracle.listen_port == 8099
     assert cfg.oracle.timezone == "UTC"
-    assert cfg.oracle.budget == 1234
     assert cfg.oracle.ascendant_window_seconds == 30
     assert cfg.oracle.dsn_env == "CUSTOM_QUERY_DSN"
     assert cfg.oracle.nodes == ("nyx", "athena")
@@ -628,7 +625,7 @@ def test_config_oracle_rejects_bad_timezone():
 
 
 def test_config_oracle_rejects_bad_numeric_values():
-    for key in ("listen_port", "budget", "ascendant_window_seconds"):
+    for key in ("listen_port", "ascendant_window_seconds"):
         with pytest.raises(ValueError, match=f"oracle.{key}"):
             Config.from_dict({
                 "proxy": {

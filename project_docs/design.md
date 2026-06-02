@@ -132,7 +132,7 @@ the Night Sky "Ascendant" drill-in.
   defined procedurally in the mockup — reproduce as LVGL canvas paths or small image
   assets.
 - Fonts: Cinzel + Cormorant (subset the needed weights/glyphs for the MCU).
-- The mockup uses placeholder/representative data (today ≈ 1.30M, budget 2.0M,
+- The mockup uses placeholder/representative data (today ≈ 1.30M,
   Mnemosyne ascendant). Real values come from `/metrics`.
 - Feasibility honesty: the Night Sky is the most custom-draw face — prototype it first
   (see `implementation-plan.md §6 Phase 3`). The Pantheon and Ephemeris map largely to
