@@ -4,12 +4,12 @@ proxy:
   upstream_url: "http://localhost:1234"
 
 node:
-  id: "local"                # set per machine when central sync is enabled (e.g. athena)
+  id: "athena"               # stable machine id for central reporting
 
 database:
   path: "~/.token_sidecar/tokens.db"
   central:
-    enabled: false
+    enabled: true
     driver: "postgres"
     dsn_env: "TOKEN_SIDECAR_POSTGRES_DSN"
     flush_interval_seconds: 5
@@ -21,3 +21,10 @@ logging:
 launchd:
   enabled: true
   label: "com.athena.token-sidecar"
+
+dashboard:
+  enabled: false                 # inference server: dashboard disabled
+  listen_host: "0.0.0.0"
+  listen_port: 8088
+  feed_initial_rows: 50
+  poll_interval_ms: 2200

@@ -196,4 +196,60 @@ ORDER BY total_tokens DESC;
 
 ---
 
-*Last updated: 2026-05-18*
+## Central Postgres (`token_usage`)
+
+The central database lives on the postgres box and accumulates rows from every
+sidecar instance via `central_sync.py`. The dashboard (`dashboard.py`) queries
+this table read-only via the `TOKEN_SIDECAR_QUERY_DSN` env var.
+
+```sql
+CREATE TABLE token_usage (
+    event_id          TEXT                    PRIMARY KEY,
+    timestamp         TIMESTAMPTZ             NOT NULL,
+    node_id           TEXT                    NOT NULL,
+    model             TEXT                    NOT NULL,
+    prompt_tokens     INTEGER                 NOT NULL DEFAULT 0,
+    completion_tokens INTEGER                 NOT NULL DEFAULT 0,
+    total_tokens      INTEGER                 NOT NULL DEFAULT 0,
+    response_ms       DOUBLE PRECISION        NOT NULL,
+    endpoint          TEXT                    NOT NULL DEFAULT '/v1/unknown',
+    status_code       INTEGER                 NOT NULL DEFAULT 200,
+    ingested_at       TIMESTAMPTZ             NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_token_usage_timestamp         ON token_usage (timestamp);
+CREATE INDEX idx_token_usage_model_timestamp   ON token_usage (model, timestamp);
+CREATE INDEX idx_token_usage_node_timestamp    ON token_usage (node_id, timestamp);
+```
+
+### Differences from the local SQLite table
+
+| Aspect            | Local SQLite        | Central Postgres                          |
+| ----------------- | ------------------- | ----------------------------------------- |
+| Primary key       | `id INTEGER`        | `event_id TEXT` (deterministic per call)  |
+| Timestamp type    | `TEXT` ISO-8601 UTC | `TIMESTAMPTZ`                             |
+| Multi-host        | no                  | `node_id TEXT` per row                    |
+| Endpoint / status | not stored          | `endpoint`, `status_code`                 |
+| Ingestion time    | n/a                 | `ingested_at` set by Postgres `now()`     |
+
+### Query rules used by the dashboard
+
+The dashboard applies these filters and conventions uniformly:
+
+- **Probe rows are excluded** from every analytics query:
+  ```sql
+  WHERE COALESCE(endpoint, '') <> '/probe'
+    AND COALESCE(model, '')    <> 'probe'
+    AND event_id NOT LIKE 'permission-probe-%'
+  ```
+- **Day boundaries are UTC.** All SQL uses
+  `(timestamp AT TIME ZONE 'UTC')::date` rather than `current_date` or
+  `now()::date`, so the answer does not depend on the Postgres session
+  timezone.
+- **Polling cursor** is `(timestamp, event_id)`, returned oldest-first, so
+  the activity-feed merge is deterministic even when multiple rows share a
+  timestamp.
+
+---
+
+*Last updated: 2026-05-19*

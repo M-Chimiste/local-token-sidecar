@@ -19,6 +19,9 @@ htmlcov/
 *.db
 *.log
 .token_sidecar/
+.env
+.env.*
+!.env.example
 
 # Local-only helper scripts
 scripts/*
@@ -35,3 +38,4 @@ scripts/*
 
 # macOS
 .DS_Store
+token_sidecar_postgres.env

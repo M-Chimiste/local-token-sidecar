@@ -30,6 +30,28 @@ REQUIRED_KEYS: list[str] = [
 
 
 @dataclass(frozen=True)
+class DashboardConfig:
+    """
+    Read-only dashboard service configuration (postgres box only).
+
+    Attributes:
+        enabled:           Gate for `setup_launchd.py install --service dashboard`.
+                           Does NOT stop `python dashboard.py` from serving when
+                           invoked directly.
+        listen_host:       Bind address (default "0.0.0.0").
+        listen_port:       TCP port (default 8080).
+        feed_initial_rows: Activity-feed bootstrap + trim length.
+        poll_interval_ms:  Client live-tick poll cadence in ms.
+    """
+
+    enabled: bool = False
+    listen_host: str = "0.0.0.0"
+    listen_port: int = 8080
+    feed_initial_rows: int = 50
+    poll_interval_ms: int = 2200
+
+
+@dataclass(frozen=True)
 class CentralDatabaseConfig:
     """Configuration for optional centralized Postgres reporting."""
 
@@ -53,6 +75,7 @@ class Config:
                        (e.g. "http://localhost:1234").
         database_path: Expanded filesystem path to the SQLite DB file.
         log_level:     Logging level string (DEBUG, INFO, WARNING, ERROR).
+        dashboard:     Optional dashboard service settings (postgres box only).
         node_id:       Stable reporting identity for this sidecar machine.
         central:       Optional central Postgres sync configuration.
         _raw:          Original dict for forward compatibility.
@@ -65,6 +88,7 @@ class Config:
     log_level: str
     node_id: str
     central: CentralDatabaseConfig
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     _raw: dict = field(default_factory=dict)
 
     @classmethod
@@ -80,6 +104,7 @@ class Config:
         database = _get(d, "database") or {}
         node = _get(d, "node") or {}
         logging_cfg = _get(d, "logging") or {}
+        dashboard_cfg = _get(d, "dashboard") or {}
         central_cfg = database.get("central") or {}
 
         # Check for missing required keys (not log_level which is optional)
@@ -135,6 +160,14 @@ class Config:
         if central_enabled and batch_size <= 0:
             raise ValueError("database.central.batch_size must be > 0.")
 
+        dashboard = DashboardConfig(
+            enabled=bool(dashboard_cfg.get("enabled", False)),
+            listen_host=str(dashboard_cfg.get("listen_host", "0.0.0.0")),
+            listen_port=int(dashboard_cfg.get("listen_port", 8080)),
+            feed_initial_rows=int(dashboard_cfg.get("feed_initial_rows", 50)),
+            poll_interval_ms=int(dashboard_cfg.get("poll_interval_ms", 2200)),
+        )
+
         return cls(
             listen_host=str(proxy["listen_host"]),
             listen_port=int(proxy["listen_port"]),
@@ -150,6 +183,7 @@ class Config:
                 flush_interval_seconds=flush_interval,
                 batch_size=batch_size,
             ),
+            dashboard=dashboard,
             _raw=dict(d),
         )
 

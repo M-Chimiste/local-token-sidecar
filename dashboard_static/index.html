@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" data-theme="quiet">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Token Sidecar · Dashboard</title>
+
+  <script>
+    // Pre-paint theme resolution: runs before stylesheets paint so dark-OS
+    // users don't see a light-mode flash on first load. Source of truth at
+    // runtime is useTheme() in app.jsx; this script just gets the first frame
+    // right.
+    (function () {
+      try {
+        var p = localStorage.getItem('ts-theme') || 'auto';
+        var dark = p === 'terminal' ||
+          (p === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.setAttribute('data-theme', dark ? 'terminal' : 'quiet');
+      } catch (_) { /* localStorage may be unavailable; fall back to html attr */ }
+    })();
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="vendor/react.production.min.js"></script>
+  <script src="vendor/react-dom.production.min.js"></script>
+  <script src="vendor/babel.min.js"></script>
+
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="components.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+</body>
+</html>

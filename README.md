@@ -1,6 +1,6 @@
 # Token Counter Sidecar
 
-**Python:** 3.11+ · **macOS only** · **Optional central Postgres reporting**
+**Python:** 3.11+ · **Tests:** 100 passing · **macOS only**
 
 A lightweight HTTP proxy that sits in front of LM Studio, intercepts every LLM API response, writes token usage to a local SQLite outbox, and can flush it to a central Postgres database for cross-machine reporting.
 
@@ -197,6 +197,98 @@ TOKEN_SIDECAR_DB=/path/to/tokens.db uv run python -m queries.summary daily
 
 ---
 
+## Dashboard
+
+A read-only web dashboard for the **central Postgres** `token_usage` table.
+Intended to run on the postgres box only — not on the same machine doing
+inference (it's a separate process).
+
+### Run it
+
+```bash
+# Set the read-side DSN (or put this in ~/.token_sidecar/env.sh)
+export TOKEN_SIDECAR_QUERY_DSN='postgresql://token_sidecar_reader:...@host:5432/token_sidecar'
+
+uv run python dashboard.py            # binds 0.0.0.0:8080 by default
+open http://localhost:8080/
+```
+
+If `TOKEN_SIDECAR_QUERY_DSN` is unset, `dashboard.py` prints a clear error and
+exits 0 (clean exit; the launchd `KeepAlive` policy won't respawn it into a
+crash loop).
+
+### What you see
+
+- **KPI tiles** — Tokens today, Requests today, Avg response, Active models — each with delta vs. same time yesterday and a 14-day sparkline
+- **Tokens over time** — stacked-by-model time series (hourly for 1d, daily for 7d/30d, daily-or-weekly for all-time)
+- **By machine** — token share per `node_id` (athena, metis, …)
+- **Models leaderboard** — table of model usage for the selected range
+- **Recent activity** — live-updating feed of recent requests
+- **Tweaks panel** — switch between Quiet and Terminal themes, chart modes, sparkline visibility
+
+### API
+
+All under `/api`. Every endpoint filters out probe rows
+(`/probe` endpoint, `model = 'probe'`, or `event_id` like
+`permission-probe-%`). Repeated `model=`/`node=` params narrow results.
+
+| Path                                          | Returns                                           |
+| --------------------------------------------- | ------------------------------------------------- |
+| `GET /api/meta`                               | `{ now, models[], hosts[] }`                      |
+| `GET /api/kpi?model=...&node=...`             | today / yesterday-same-time / sparkline_14d       |
+| `GET /api/buckets?range=1d\|7d\|30d\|all`     | server-bucketed totals by `(bucket, model)`       |
+| `GET /api/leaderboard?range=…`                | per-model aggregates                              |
+| `GET /api/by-host?range=…`                    | per-node aggregates with model breakdown          |
+| `GET /api/rows?since_ts=...&since_id=...`     | activity feed rows, cursored on `(ts, event_id)`  |
+| `GET /healthz`                                | liveness probe — does not touch Postgres          |
+
+### Configuration
+
+```yaml
+dashboard:
+  enabled: false                 # gate for setup_launchd.py install --service dashboard
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+  feed_initial_rows: 50
+  poll_interval_ms: 2200
+```
+
+`enabled` does **not** stop the binary from serving — `python dashboard.py`
+always serves. The flag is only consulted by the launchd install command
+(below).
+
+### Install as a launchd service (postgres box only)
+
+```bash
+# 1. Land the DSN
+mkdir -p ~/.token_sidecar
+echo 'export TOKEN_SIDECAR_QUERY_DSN=postgresql://...' > ~/.token_sidecar/env.sh
+chmod 600 ~/.token_sidecar/env.sh
+
+# 2. Flip the gate in config.yaml
+#    dashboard:
+#      enabled: true
+
+# 3. Install (refuses if any pre-flight check fails — env file, config gate,
+#    psycopg import, or SELECT 1 round-trip)
+uv run python setup_launchd.py install --service dashboard
+launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar-dashboard
+
+# Status / unload / remove
+uv run python setup_launchd.py status --service dashboard
+uv run python setup_launchd.py unload --service dashboard
+uv run python setup_launchd.py remove --service dashboard
+```
+
+The plist (`com.athena.token-sidecar-dashboard`) uses a `/bin/sh` wrapper
+that conditionally sources `~/.token_sidecar/env.sh` and always exec's
+python — so a missing env file does not short-circuit before python runs.
+Combined with `KeepAlive: {SuccessfulExit: false}` and the clean-exit
+behavior on missing DSN, a misconfigured install stays down with a log
+message rather than crash-looping launchd.
+
+---
+
 ## Install & Uninstall
 
 ### `./install.sh` — full setup
@@ -320,11 +412,11 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 | File | Purpose |
 |------|---------|
 | `sidecar.py` | Main proxy — aiohttp app, intercepts responses, logs to SQLite |
-| `db.py` | SQLite schema, local outbox/cache helpers, and SQLite summaries |
-| `central_sync.py` | Background flush helper: upload queued SQLite rows to Postgres and delete acknowledged rows |
-| `postgres_store.py` | Postgres schema, batch insert, and central summary queries |
-| `config_loader.py` | YAML config loader with typed `Config` dataclass and `--config` CLI override |
-| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (manual alternative) |
+| `dashboard.py` | Read-only dashboard service (postgres box) — serves the React UI and `/api/*` JSON endpoints |
+| `dashboard_static/` | HTML/CSS/JSX assets for the dashboard, plus vendored React + Babel |
+| `db.py` | SQLite schema + CRUD helpers (`init_db`, `log_token_usage`, `get_daily_summary`, `get_hourly_summary`) |
+| `config_loader.py` | YAML config loader with typed `Config` + `DashboardConfig` dataclasses and `--config` CLI override |
+| `setup_launchd.py` | LaunchAgent plist generator + CLI: install / unload / remove / status (`--service sidecar\|dashboard`) |
 | `queries/summary.py` | Click-based query CLI with `daily`, `hourly`, `by-model` subcommands |
 | `scripts/setup_nyx_postgres.sh` | One-shot nyx setup wrapper: start Homebrew Postgres and run central bootstrap |
 | `scripts/bootstrap_postgres.py` | One-shot central Postgres database, role, schema, and grant bootstrap |
@@ -338,7 +430,7 @@ launchctl kickstart -kp gui/$(id -u)/com.athena.token-sidecar
 ## Development
 
 ```bash
-# Run the full test suite
+# Run the full test suite (100 tests)
 uv run python -m pytest tests/ -v
 
 # Run a specific test file
@@ -347,4 +439,4 @@ uv run python -m pytest tests/test_db.py -v
 
 ---
 
-*Last updated: 2026-05-18*
+*Last updated: 2026-05-19*
