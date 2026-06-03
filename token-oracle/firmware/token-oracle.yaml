@@ -1,0 +1,1324 @@
+substitutions:
+  device_name: token-oracle
+  friendly_name: Token Oracle
+  metrics_host: Nyx.local
+  metrics_port: "8090"
+  metrics_path: /metrics
+  poll_interval: 20s
+
+  # "Mythos" palette (design.md §3) — the single locked definition. Reference
+  # these everywhere instead of inline hex so the verdigris rule stays auditable.
+  c_ink: "0x04050A"           # ground / background
+  c_gold: "0xC9A24B"          # divine default — lines, labels, titles
+  c_gold_bright: "0xF3DA94"   # numerals, highlights, lit stars
+  c_gold_dim: "0x6F5A2E"      # secondary/dim text, faint ticks, inactive dot
+  c_verdigris: "0x46C2A6"     # RESERVED: ascendant / alive only
+  c_verdigris_pale: "0xA8ECDB" # RESERVED: non-live constellation accents
+  c_text_dim: "0x9A8F6B"      # captions
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [st7701s]
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.7.0
+  includes:
+    - token_dash_helpers.h
+    - oracle_faces.h
+  project:
+    name: athena.token_oracle
+    version: phase2
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: display_backlight
+          brightness: 55%
+      - script.execute: refresh_oracle_labels
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Keep the RGB LCD bounce-buffer refill ISR (and its GDMA control) in
+      # IRAM so a Wi-Fi/HTTP burst during the metrics poll can't delay it and
+      # underrun a frame. Removes the single poll-time flicker.
+      CONFIG_LCD_RGB_ISR_IRAM_SAFE: "y"
+      CONFIG_GDMA_CTRL_FUNC_IN_IRAM: "y"
+      # Place instructions + rodata in PSRAM so the CPU keeps executing (and the
+      # RGB bounce-buffer ISR keeps being served from PSRAM) while the flash
+      # cache is disabled during a flash operation. Without this, a flash op that
+      # coincides with the RGB DMA faults with "Cache error" in
+      # lcd_rgb_panel_fill_bounce_buffer. Matches the proven-stable Argus board.
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Default light modem-sleep wakes the radio every DTIM/beacon (~1-3s); each
+  # wake is a bus/CPU burst that starves the RGB LCD refill for one frame -> a
+  # periodic few-second flicker. Keep the radio steady to remove it. The Oracle
+  # is mains-powered, so the extra idle draw is irrelevant.
+  power_save_mode: none
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: device_time
+    timezone: America/New_York
+
+json:
+
+http_request:
+  useragent: TokenOracle-Phase1
+  timeout: 5s
+
+i2c:
+  - id: i2c_bus
+    sda: GPIO15
+    scl: GPIO07
+    scan: true
+
+pca9554:
+  - id: p_c_a
+    address: 0x20
+    i2c_id: i2c_bus
+
+spi:
+  - id: spi_lcd
+    clk_pin: GPIO02
+    mosi_pin: GPIO01
+    interface: spi3
+
+output:
+  - platform: ledc
+    pin: GPIO06
+    id: backlight_pwm
+    # 2kHz PWM is low enough to be perceived as backlight shimmer. Argus drives
+    # this panel's backlight at 5kHz; 20kHz is comfortably above the flicker
+    # perception range and still leaves ~12-bit dimming resolution.
+    frequency: 20000Hz
+    channel: 0
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    id: display_backlight
+    name: Display Backlight
+    restore_mode: ALWAYS_ON
+    gamma_correct: 1
+
+# Cinzel (engraved Roman caps -> titles/labels) + Cormorant (numerals/readouts),
+# per design.md §3 typography. Downloaded from Google Fonts at build time and
+# glyph-subset to keep flash footprint tiny: Cinzel ships caps+digits+a little
+# punctuation, Cormorant ships only the compact-number charset. Built-in
+# montserrat stays the default_font fallback and powers the diagnostic line.
+font:
+  - file: "gfonts://Cinzel"
+    id: cinzel_28
+    size: 28
+    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%"
+  - file: "gfonts://Cinzel"
+    id: cinzel_14
+    size: 14
+    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%"
+  - file: "gfonts://Cormorant@600"
+    id: cormorant_48
+    size: 48
+    glyphs: "0123456789.,:KMB -"
+  - file: "gfonts://Cormorant@600"
+    id: cormorant_20
+    size: 20
+    glyphs: "0123456789.,:KMB -"
+
+globals:
+  - id: oracle_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: current_face
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # --- Phase 3 data globals (parsed from /metrics, read by the face renderers) ---
+  - id: oracle_ascendant      # god code: 0 none,1 mnemosyne,2 athena,3 metis,4 nyx
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_tot_nyx
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_tot_mnemosyne
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_tot_athena
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_tot_metis
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_tot_theseus
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_prompt
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_completion
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_requests
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_zenith_hour
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: oracle_zenith_tokens
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_span_first
+    type: std::string
+    restore_value: no
+    initial_value: '"--:--"'
+  - id: oracle_span_last
+    type: std::string
+    restore_value: no
+    initial_value: '"--:--"'
+  - id: oracle_trend_mean
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_trend_delta
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_trend_phase
+    type: float
+    restore_value: no
+    initial_value: "0.5"
+  - id: oracle_high_water
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_last_http_status
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: oracle_today_total
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: oracle_last_update
+    type: std::string
+    restore_value: no
+    initial_value: '"never"'
+  - id: oracle_have_rendered_metrics
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: oracle_rendered_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: oracle_rendered_http_status
+    type: int
+    restore_value: no
+    initial_value: "-999"
+  - id: oracle_rendered_today_total
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+display:
+  - platform: st7701s
+    id: oracle_display
+    spi_id: spi_lcd
+    spi_mode: MODE0
+    # RGB element order (matches the working Argus stack on this panel). BGR here
+    # swapped red/blue, so gold (#C9A24B) rendered as cyan-blue (#4BA2C9).
+    color_order: RGB
+    data_rate: 40MHz
+    invert_colors: false
+    dimensions:
+      width: 480
+      height: 480
+    cs_pin:
+      pca9554: p_c_a
+      number: 2
+      mode:
+        output: true
+    reset_pin:
+      pca9554: p_c_a
+      number: 0
+      mode:
+        output: true
+    de_pin: GPIO40
+    hsync_pin: GPIO38
+    vsync_pin: GPIO39
+    pclk_pin: GPIO41
+    # 18MHz (~65Hz) leaves little PSRAM-bandwidth margin, so the 20s metrics
+    # poll's Wi-Fi burst can still outrun the bounce-buffer refill and flicker
+    # one frame. 14MHz (~50Hz) cuts baseline LCD demand ~22%; on an LCD a lower
+    # refresh does not flicker (pixels hold state), it only affects motion.
+    pclk_frequency: 14MHz
+    pclk_inverted: false
+    hsync_pulse_width: 8
+    hsync_back_porch: 10
+    hsync_front_porch: 50
+    vsync_pulse_width: 2
+    vsync_back_porch: 18
+    vsync_front_porch: 8
+    init_sequence:
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x13]
+      - [0xEF, 0x08]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xC0, 0x3B, 0x00]
+      - [0xC1, 0x10, 0x0C]
+      - [0xC2, 0x07, 0x0A]
+      - [0xC7, 0x00]
+      - [0xCC, 0x10]
+      - [0xCD, 0x08]
+      - [0xB0, 0x05, 0x12, 0x98, 0x0E, 0x0F, 0x07, 0x07, 0x09, 0x09, 0x23, 0x05, 0x52, 0x0F, 0x67, 0x2C, 0x11]
+      - [0xB1, 0x0B, 0x11, 0x97, 0x0C, 0x12, 0x06, 0x06, 0x08, 0x08, 0x22, 0x03, 0x51, 0x11, 0x66, 0x2B, 0x0F]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x11]
+      - [0xB0, 0x5D]
+      - [0xB1, 0x3E]
+      - [0xB2, 0x81]
+      - [0xB3, 0x80]
+      - [0xB5, 0x4E]
+      - [0xB7, 0x85]
+      - [0xB8, 0x20]
+      - [0xC1, 0x78]
+      - [0xC2, 0x78]
+      - [0xD0, 0x88]
+      - [0xE0, 0x00, 0x00, 0x02]
+      - [0xE1, 0x06, 0x30, 0x08, 0x30, 0x05, 0x30, 0x07, 0x30, 0x00, 0x33, 0x33]
+      - [0xE2, 0x11, 0x11, 0x33, 0x33, 0xF4, 0x00, 0x00, 0x00, 0xF4, 0x00, 0x00, 0x00]
+      - [0xE3, 0x00, 0x00, 0x11, 0x11]
+      - [0xE4, 0x44, 0x44]
+      - [0xE5, 0x0D, 0xF5, 0x30, 0xF0, 0x0F, 0xF7, 0x30, 0xF0, 0x09, 0xF1, 0x30, 0xF0, 0x0B, 0xF3, 0x30, 0xF0]
+      - [0xE6, 0x00, 0x00, 0x11, 0x11]
+      - [0xE7, 0x44, 0x44]
+      - [0xE8, 0x0C, 0xF4, 0x30, 0xF0, 0x0E, 0xF6, 0x30, 0xF0, 0x08, 0xF0, 0x30, 0xF0, 0x0A, 0xF2, 0x30, 0xF0]
+      - [0xE9, 0x36, 0x01]
+      - [0xEB, 0x00, 0x01, 0xE4, 0xE4, 0x44, 0x88, 0x40]
+      - [0xED, 0xFF, 0x10, 0xAF, 0x76, 0x54, 0x2B, 0xCF, 0xFF, 0xFF, 0xFC, 0xB2, 0x45, 0x67, 0xFA, 0x01, 0xFF]
+      - [0xEF, 0x08, 0x08, 0x08, 0x45, 0x3F, 0x54]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x00]
+      - [0x11]
+      - delay 120ms
+      - [0x3A, 0x66]
+      - [0x36, 0x00]
+      - [0x35, 0x00]
+      - [0x29]
+    data_pins:
+      - GPIO5
+      - GPIO45
+      - GPIO48
+      - GPIO47
+      - GPIO21
+      - GPIO14
+      - GPIO13
+      - GPIO12
+      - GPIO11
+      - GPIO10
+      - GPIO9
+      - GPIO46
+      - GPIO3
+      - GPIO8
+      - GPIO18
+      - GPIO17
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: gt911
+    id: oracle_touchscreen
+    i2c_id: i2c_bus
+    interrupt_pin: GPIO16
+    reset_pin:
+      pca9554: p_c_a
+      number: 1
+      mode:
+        output: true
+    # Edge-tap paging (mirrors the mockup): left ~28% of the round face goes
+    # back, the rest advances; both wrap. Large zones dodge GT911 edge
+    # non-linearity. The pager dot follows via each page's on_load.
+    on_touch:
+      then:
+        - if:
+            condition:
+              lambda: "return touch.x < 134;"
+            then:
+              - lvgl.page.previous:
+                  animation: OVER_RIGHT
+                  time: 250ms
+            else:
+              - lvgl.page.next:
+                  animation: OVER_LEFT
+                  time: 250ms
+
+lvgl:
+  displays:
+    - oracle_display
+  touchscreens:
+    - touchscreen_id: oracle_touchscreen
+  buffer_size: 100%
+  full_refresh: true
+  bg_color: ${c_ink}
+  text_color: ${c_gold}
+  default_font: montserrat_20
+  byte_order: little_endian
+
+  # Reusable theme styles (define once, apply via `styles:` on widgets). These
+  # are the Phase 2 framework: every face draws from this vocabulary.
+  style_definitions:
+    - id: style_title          # Cinzel engraved caps, letter-spaced
+      text_font: cinzel_28
+      text_color: ${c_gold}
+      text_letter_space: 5
+      text_align: CENTER
+    - id: style_caption        # small dim Cinzel caption
+      text_font: cinzel_14
+      text_color: ${c_text_dim}
+      text_letter_space: 3
+      text_align: CENTER
+    - id: style_numeral        # Cormorant hero readout
+      text_font: cormorant_48
+      text_color: ${c_gold_bright}
+      text_align: CENTER
+    - id: style_ascendant      # RESERVED for the live/ascendant element (Phase 3)
+      text_color: ${c_verdigris}
+
+  # Shared chrome: a 3-dot pager that persists across faces on the top layer.
+  # dot_0 starts lit (face 0 = Night Sky); set_pager keeps it in sync on paging.
+  top_layer:
+    widgets:
+      - obj:
+          id: dot_0
+          align: BOTTOM_MID
+          x: -14
+          y: -16
+          width: 8
+          height: 8
+          radius: 4
+          border_width: 0
+          bg_opa: COVER
+          bg_color: ${c_gold_bright}
+      - obj:
+          id: dot_1
+          align: BOTTOM_MID
+          x: 0
+          y: -16
+          width: 8
+          height: 8
+          radius: 4
+          border_width: 0
+          bg_opa: COVER
+          bg_color: ${c_gold_dim}
+      - obj:
+          id: dot_2
+          align: BOTTOM_MID
+          x: 14
+          y: -16
+          width: 8
+          height: 8
+          radius: 4
+          border_width: 0
+          bg_opa: COVER
+          bg_color: ${c_gold_dim}
+
+  pages:
+    # Face 0 — The Night Sky. Keeps the live today.total so the data path stays
+    # visible through the new framework; full starfield/constellations land in
+    # Phase 3.
+    - id: night_sky
+      bg_color: ${c_ink}
+      bg_opa: COVER
+      on_load:
+        then:
+          - lambda: "id(current_face) = 0;"
+          - script.execute: set_pager
+          - script.execute: render_sky
+      widgets:
+        - canvas:
+            id: sky_canvas
+            width: 480
+            height: 480
+        - label:
+            id: total_label
+            align: CENTER
+            y: -4
+            text: waiting
+            styles: style_numeral
+        - label:
+            id: subtitle_label
+            align: CENTER
+            y: 34
+            text: TRIBUTE GATHERED
+            styles: style_caption
+        # Per-god constellation labels: name tinted to the god's color, count in
+        # bright gold. Colors match the CONSTELLATIONS table in oracle_faces.h.
+        - label:
+            id: nyx_name
+            align: TOP_MID
+            y: 132
+            text: NYX
+            text_font: cinzel_14
+            text_color: 0xF3ECCF
+        - label:
+            id: nyx_count
+            align: TOP_MID
+            y: 150
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: mne_name
+            align: TOP_LEFT
+            x: 88
+            y: 70
+            text: MNEMOSYNE
+            text_font: cinzel_14
+            text_color: 0x46C2A6
+        - label:
+            id: mne_count
+            align: TOP_LEFT
+            x: 88
+            y: 88
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: ath_name
+            align: TOP_RIGHT
+            x: -92
+            y: 132
+            text: ATHENA
+            text_font: cinzel_14
+            text_color: 0xC9A24B
+        - label:
+            id: ath_count
+            align: TOP_RIGHT
+            x: -92
+            y: 150
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: met_name
+            align: TOP_LEFT
+            x: 76
+            y: 292
+            text: METIS
+            text_font: cinzel_14
+            text_color: 0xC678DD
+        - label:
+            id: met_count
+            align: TOP_LEFT
+            x: 76
+            y: 310
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: the_name
+            align: TOP_LEFT
+            x: 300
+            y: 286
+            text: THESEUS
+            text_font: cinzel_14
+            text_color: 0x6FB7E0
+        - label:
+            id: the_count
+            align: TOP_LEFT
+            x: 300
+            y: 304
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+
+    # Face 1 — The Pantheon (blank themed page; orbital rings land in Phase 3).
+    - id: pantheon
+      bg_color: ${c_ink}
+      bg_opa: COVER
+      on_load:
+        then:
+          - lambda: "id(current_face) = 1;"
+          - script.execute: set_pager
+          - script.execute: render_pantheon
+          - script.execute: refresh_pantheon
+      widgets:
+        - canvas:
+            id: pantheon_canvas
+            width: 480
+            height: 480
+        - label:
+            id: p_total
+            align: CENTER
+            y: -4
+            text: waiting
+            styles: style_numeral
+        - label:
+            id: p_caption
+            align: CENTER
+            y: 34
+            text: TRIBUTE GATHERED
+            styles: style_caption
+        # Per-god orb labels; positioned at each ring's arc tip by refresh_pantheon.
+        - label:
+            id: pan_nyx_name
+            text: NYX
+            text_font: cinzel_14
+            text_color: 0xF3ECCF
+        - label:
+            id: pan_nyx_count
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: pan_mne_name
+            text: MNEMOSYNE
+            text_font: cinzel_14
+            text_color: 0x46C2A6
+        - label:
+            id: pan_mne_count
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: pan_ath_name
+            text: ATHENA
+            text_font: cinzel_14
+            text_color: 0xC9A24B
+        - label:
+            id: pan_ath_count
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: pan_met_name
+            text: METIS
+            text_font: cinzel_14
+            text_color: 0xC678DD
+        - label:
+            id: pan_met_count
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: pan_the_name
+            text: THESEUS
+            text_font: cinzel_14
+            text_color: 0x6FB7E0
+        - label:
+            id: pan_the_count
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+
+    # Face 2 — The Ephemeris (blank themed page; moon + readings land in Phase 3).
+    - id: ephemeris
+      bg_color: ${c_ink}
+      bg_opa: COVER
+      on_load:
+        then:
+          - lambda: "id(current_face) = 2;"
+          - script.execute: set_pager
+          - script.execute: render_ephemeris
+          - script.execute: refresh_ephemeris
+      widgets:
+        - canvas:
+            id: ephemeris_canvas
+            width: 480
+            height: 480
+        - label:
+            id: e_title
+            align: TOP_MID
+            y: 40
+            text: EPHEMERIS
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_date
+            align: TOP_MID
+            y: 58
+            text: "--"
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_total
+            align: CENTER
+            y: 6
+            text: waiting
+            styles: style_numeral
+        - label:
+            id: e_trend
+            align: CENTER
+            y: 46
+            text: "--"
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        # Six readings (caption Cinzel + value Cormorant), left and right columns.
+        - label:
+            id: e_inv_l
+            align: TOP_LEFT
+            x: 44
+            y: 182
+            text: INVOCATIONS
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_inv_v
+            align: TOP_LEFT
+            x: 44
+            y: 200
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: e_bal_l
+            align: TOP_LEFT
+            x: 44
+            y: 240
+            text: BALANCE
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_bal_v
+            align: TOP_LEFT
+            x: 44
+            y: 258
+            text: "0 : 0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: e_dwn_l
+            align: TOP_LEFT
+            x: 44
+            y: 298
+            text: DAWN-DUSK
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_dwn_v
+            align: TOP_LEFT
+            x: 44
+            y: 316
+            text: "--:--"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: e_zen_l
+            align: TOP_RIGHT
+            x: -44
+            y: 182
+            text: ZENITH
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_zen_v
+            align: TOP_RIGHT
+            x: -44
+            y: 200
+            text: "--"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+        - label:
+            id: e_rgn_l
+            align: TOP_RIGHT
+            x: -44
+            y: 240
+            text: REIGNING
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_rgn_v
+            align: TOP_RIGHT
+            x: -44
+            y: 258
+            text: NONE
+            text_font: cinzel_14
+            text_color: ${c_gold_bright}
+        - label:
+            id: e_hi_l
+            align: TOP_RIGHT
+            x: -44
+            y: 298
+            text: HIGH-WATER
+            text_font: cinzel_14
+            text_color: ${c_gold}
+        - label:
+            id: e_hi_v
+            align: TOP_RIGHT
+            x: -44
+            y: 316
+            text: "0"
+            text_font: cormorant_20
+            text_color: ${c_gold_bright}
+
+script:
+  # Canonical JSON->globals->refresh render step. Phase 3 faces extend this:
+  # parse a /metrics field into a global (interval below), delta-check it, then
+  # update the bound widget here. Compact formatting lives in token_dash_helpers.h.
+  - id: refresh_oracle_labels
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: total_label
+          text: !lambda "return oracle_fmt_compact(id(oracle_today_total));"
+      - lvgl.label.update:
+          id: nyx_count
+          text: !lambda "return oracle_fmt_compact(id(oracle_tot_nyx));"
+      - lvgl.label.update:
+          id: mne_count
+          text: !lambda "return oracle_fmt_compact(id(oracle_tot_mnemosyne));"
+      - lvgl.label.update:
+          id: ath_count
+          text: !lambda "return oracle_fmt_compact(id(oracle_tot_athena));"
+      - lvgl.label.update:
+          id: met_count
+          text: !lambda "return oracle_fmt_compact(id(oracle_tot_metis));"
+      - lvgl.label.update:
+          id: the_count
+          text: !lambda "return oracle_fmt_compact(id(oracle_tot_theseus));"
+
+  # Light the dot for current_face, dim the others (shared pager chrome).
+  - id: set_pager
+    mode: restart
+    then:
+      - lambda: |-
+          lv_color_t on = lv_color_hex(${c_gold_bright});
+          lv_color_t off = lv_color_hex(${c_gold_dim});
+          int f = id(current_face);
+          lv_obj_set_style_bg_color(id(dot_0), f == 0 ? on : off, LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(dot_1), f == 1 ? on : off, LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(dot_2), f == 2 ? on : off, LV_PART_MAIN);
+
+  # Night Sky renderer: draws the whole face into sky_canvas via the LVGL 9
+  # layer API. Time-based so it animates when called on an interval; rendering
+  # it once (on_load) gives a static frame. Geometry/tables live in oracle_faces.h.
+  - id: render_sky
+    mode: restart
+    then:
+      - lambda: |-
+          lv_obj_t *cv = id(sky_canvas);
+          lv_canvas_fill_bg(cv, lv_color_hex(${c_ink}), LV_OPA_COVER);
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+
+          const float t = millis() / 1000.0f;
+          const float rot = fmodf(t * (360.0f / 280.0f), 360.0f);  // ~280s/turn
+
+          lv_draw_rect_dsc_t rd;
+          lv_draw_rect_dsc_init(&rd);
+          rd.radius = LV_RADIUS_CIRCLE;
+          rd.border_width = 0;
+
+          // --- background starfield (rotating, twinkling) ---
+          static oracle::BgStar bg[oracle::BG_STARS];
+          static bool bg_ready = false;
+          if (!bg_ready) { oracle::bg_init(bg, oracle::BG_STARS); bg_ready = true; }
+          for (int i = 0; i < oracle::BG_STARS; i++) {
+            float x, y;
+            oracle::pt(bg[i].rad, bg[i].ang_deg + rot, x, y);
+            float k = 1.0f;
+            if (bg[i].twinkles) k = 0.55f + 0.45f * sinf(t * bg[i].tw_speed + bg[i].tw_phase);
+            if (k < 0) k = 0; if (k > 1) k = 1;
+            rd.bg_color = lv_color_hex(bg[i].warm ? 0xF3ECCF : 0xCFE0FF);
+            rd.bg_opa = (lv_opa_t)(40 + k * 170);
+            int r = (int)(bg[i].size + 0.5f); if (r < 1) r = 1;
+            lv_area_t a = {(int)x - r, (int)y - r, (int)x + r, (int)y + r};
+            lv_draw_rect(&layer, &rd, &a);
+          }
+
+          // --- five constellations, each in its god's distinct color ---
+          lv_draw_line_dsc_t ld;
+          lv_draw_line_dsc_init(&ld);
+          for (int c = 0; c < oracle::N_CONSTELLATIONS; c++) {
+            const oracle::Constellation &cn = oracle::CONSTELLATIONS[c];
+            ld.color = lv_color_hex(cn.color);
+            ld.width = 1;
+            ld.opa = 110;
+            for (int e = 0; e < cn.nedges; e++) {
+              const oracle::CStar &s1 = cn.stars[cn.edges[e].a];
+              const oracle::CStar &s2 = cn.stars[cn.edges[e].b];
+              ld.p1.x = s1.x; ld.p1.y = s1.y;
+              ld.p2.x = s2.x; ld.p2.y = s2.y;
+              lv_draw_line(&layer, &ld);
+            }
+            for (int si = 0; si < cn.nstars; si++) {
+              const oracle::CStar &s = cn.stars[si];
+              int r = (int)(1.7f + s.mag * 2.6f + (s.anchor ? 1.0f : 0.0f) + 0.5f);
+              if (s.anchor) r += (int)(1.4f * (0.5f + 0.5f * sinf(t * 2.6f)));
+              if (s.anchor) {  // soft halo on the anchor star
+                rd.bg_color = lv_color_hex(cn.color);
+                rd.bg_opa = 45;
+                int gr = r * 3;
+                lv_area_t ga = {(int)s.x - gr, (int)s.y - gr, (int)s.x + gr, (int)s.y + gr};
+                lv_draw_rect(&layer, &rd, &ga);
+              }
+              rd.bg_color = lv_color_hex(cn.color);
+              rd.bg_opa = LV_OPA_COVER;
+              lv_area_t a = {(int)s.x - r, (int)s.y - r, (int)s.x + r, (int)s.y + r};
+              lv_draw_rect(&layer, &rd, &a);
+            }
+          }
+
+          lv_canvas_finish_layer(cv, &layer);
+          lv_obj_invalidate(cv);
+
+  # Pantheon renderer: faint shared starfield + one orbit ring per machine, each
+  # with a tribute arc (sweep proportional to today's tokens) and an orb at the tip.
+  - id: render_pantheon
+    mode: restart
+    then:
+      - lambda: |-
+          lv_obj_t *cv = id(pantheon_canvas);
+          lv_canvas_fill_bg(cv, lv_color_hex(${c_ink}), LV_OPA_COVER);
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+          const float t = millis() / 1000.0f;
+          const float rot = fmodf(t * (360.0f / 280.0f), 360.0f);
+
+          auto gtot = [&](int g) -> uint64_t {
+            switch (g) {
+              case oracle::GOD_MNEMOSYNE: return id(oracle_tot_mnemosyne);
+              case oracle::GOD_ATHENA: return id(oracle_tot_athena);
+              case oracle::GOD_METIS: return id(oracle_tot_metis);
+              case oracle::GOD_THESEUS: return id(oracle_tot_theseus);
+              case oracle::GOD_NYX: return id(oracle_tot_nyx);
+            }
+            return 0;
+          };
+
+          lv_draw_rect_dsc_t rd;
+          lv_draw_rect_dsc_init(&rd);
+          rd.radius = LV_RADIUS_CIRCLE;
+          rd.border_width = 0;
+
+          static oracle::BgStar bg[oracle::BG_STARS];
+          static bool pbg = false;
+          if (!pbg) { oracle::bg_init(bg, oracle::BG_STARS); pbg = true; }
+          for (int i = 0; i < oracle::BG_STARS; i++) {
+            float x, y;
+            oracle::pt(bg[i].rad, bg[i].ang_deg + rot, x, y);
+            float k = 1.0f;
+            if (bg[i].twinkles) k = 0.55f + 0.45f * sinf(t * bg[i].tw_speed + bg[i].tw_phase);
+            if (k < 0) k = 0; if (k > 1) k = 1;
+            rd.bg_color = lv_color_hex(bg[i].warm ? 0xF3ECCF : 0xCFE0FF);
+            rd.bg_opa = (lv_opa_t)(18 + k * 80);  // fainter behind the rings
+            int r = (int)(bg[i].size + 0.5f); if (r < 1) r = 1;
+            lv_area_t a = {(int)x - r, (int)y - r, (int)x + r, (int)y + r};
+            lv_draw_rect(&layer, &rd, &a);
+          }
+
+          uint64_t mx = 1;
+          for (int i = 0; i < oracle::N_RINGS; i++) { uint64_t g = gtot(oracle::RINGS[i].god); if (g > mx) mx = g; }
+
+          lv_draw_arc_dsc_t ad;
+          lv_draw_arc_dsc_init(&ad);
+          ad.center.x = (int)oracle::CX;
+          ad.center.y = (int)oracle::CY;
+          for (int i = 0; i < oracle::N_RINGS; i++) {
+            const oracle::Ring &rg = oracle::RINGS[i];
+            ad.radius = (uint16_t)rg.radius;
+            ad.color = lv_color_hex(rg.color);
+            // (Faint full-circle orbit rings were dropped: 5 full 480px-wide AA
+            // arcs per frame tanked the frame rate and made the starfield choppy.
+            // The tribute arc below already traces each ring's path.)
+            uint64_t gt = gtot(rg.god);
+            float sweep = ((float)gt / (float)mx) * oracle::ARC_MAX_DEG;
+            if (gt > 0 && sweep < 3) sweep = 3;
+            ad.width = 4; ad.opa = 220;
+            ad.start_angle = oracle::ARC_START_DEG;
+            ad.end_angle = oracle::ARC_START_DEG + sweep;
+            lv_draw_arc(&layer, &ad);
+            float tip = (oracle::ARC_START_DEG + sweep) * 0.0174533f;
+            int ox = (int)(oracle::CX + rg.radius * cosf(tip));
+            int oy = (int)(oracle::CY + rg.radius * sinf(tip));
+            rd.bg_color = lv_color_hex(rg.color);
+            rd.bg_opa = LV_OPA_COVER;
+            lv_area_t oa = {ox - 5, oy - 5, ox + 5, oy + 5};
+            lv_draw_rect(&layer, &rd, &oa);
+          }
+          lv_canvas_finish_layer(cv, &layer);
+          lv_obj_invalidate(cv);
+
+  # Position + fill the Pantheon orb labels at each ring's arc tip (runs on poll).
+  - id: refresh_pantheon
+    mode: restart
+    then:
+      - lambda: |-
+          lv_label_set_text(id(p_total), oracle_fmt_compact(id(oracle_today_total)).c_str());
+          auto gtot = [&](int g) -> uint64_t {
+            switch (g) {
+              case oracle::GOD_MNEMOSYNE: return id(oracle_tot_mnemosyne);
+              case oracle::GOD_ATHENA: return id(oracle_tot_athena);
+              case oracle::GOD_METIS: return id(oracle_tot_metis);
+              case oracle::GOD_THESEUS: return id(oracle_tot_theseus);
+              case oracle::GOD_NYX: return id(oracle_tot_nyx);
+            }
+            return 0;
+          };
+          uint64_t mx = 1;
+          for (int i = 0; i < oracle::N_RINGS; i++) { uint64_t g = gtot(oracle::RINGS[i].god); if (g > mx) mx = g; }
+          auto place = [&](int g, lv_obj_t *nm, lv_obj_t *ct) {
+            float radius = 0;
+            for (int i = 0; i < oracle::N_RINGS; i++) if (oracle::RINGS[i].god == g) radius = oracle::RINGS[i].radius;
+            uint64_t gt = gtot(g);
+            float sweep = ((float)gt / (float)mx) * oracle::ARC_MAX_DEG;
+            if (gt > 0 && sweep < 3) sweep = 3;
+            float tip = (oracle::ARC_START_DEG + sweep) * 0.0174533f;
+            int ox = (int)(oracle::CX + radius * cosf(tip));
+            int oy = (int)(oracle::CY + radius * sinf(tip));
+            lv_label_set_text(ct, oracle_fmt_compact(gt).c_str());
+            lv_obj_set_pos(nm, ox - 28, oy - 24);
+            lv_obj_set_pos(ct, ox - 18, oy - 6);
+          };
+          place(oracle::GOD_NYX, id(pan_nyx_name), id(pan_nyx_count));
+          place(oracle::GOD_MNEMOSYNE, id(pan_mne_name), id(pan_mne_count));
+          place(oracle::GOD_ATHENA, id(pan_ath_name), id(pan_ath_count));
+          place(oracle::GOD_METIS, id(pan_met_name), id(pan_met_count));
+          place(oracle::GOD_THESEUS, id(pan_the_name), id(pan_the_count));
+
+  # Ephemeris renderer: faint starfield + engraved 60-tick rim + moon glyph
+  # (phase approximated from the trend; readings are label widgets).
+  - id: render_ephemeris
+    mode: restart
+    then:
+      - lambda: |-
+          lv_obj_t *cv = id(ephemeris_canvas);
+          lv_canvas_fill_bg(cv, lv_color_hex(${c_ink}), LV_OPA_COVER);
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+          const float t = millis() / 1000.0f;
+          const float rot = fmodf(t * (360.0f / 280.0f), 360.0f);
+
+          lv_draw_rect_dsc_t rd;
+          lv_draw_rect_dsc_init(&rd);
+          rd.radius = LV_RADIUS_CIRCLE;
+          rd.border_width = 0;
+
+          static oracle::BgStar bg[oracle::BG_STARS];
+          static bool ebg = false;
+          if (!ebg) { oracle::bg_init(bg, oracle::BG_STARS); ebg = true; }
+          for (int i = 0; i < oracle::BG_STARS; i++) {
+            float x, y;
+            oracle::pt(bg[i].rad, bg[i].ang_deg + rot, x, y);
+            float k = 1.0f;
+            if (bg[i].twinkles) k = 0.55f + 0.45f * sinf(t * bg[i].tw_speed + bg[i].tw_phase);
+            if (k < 0) k = 0; if (k > 1) k = 1;
+            rd.bg_color = lv_color_hex(bg[i].warm ? 0xF3ECCF : 0xCFE0FF);
+            rd.bg_opa = (lv_opa_t)(18 + k * 70);
+            int r = (int)(bg[i].size + 0.5f); if (r < 1) r = 1;
+            lv_area_t a = {(int)x - r, (int)y - r, (int)x + r, (int)y + r};
+            lv_draw_rect(&layer, &rd, &a);
+          }
+
+          // engraved 60-tick rim (major every 5)
+          lv_draw_line_dsc_t ld;
+          lv_draw_line_dsc_init(&ld);
+          for (int i = 0; i < 60; i++) {
+            float ang = (i * 6.0f - 90.0f) * 0.0174533f;
+            bool major = (i % 5 == 0);
+            float r1 = major ? 204.0f : 212.0f;
+            float r2 = 222.0f;
+            ld.color = lv_color_hex(${c_gold});  // gold watch ticks (major brighter)
+            ld.width = major ? 2 : 1;
+            ld.opa = major ? 220 : 110;
+            ld.p1.x = oracle::CX + r1 * cosf(ang); ld.p1.y = oracle::CY + r1 * sinf(ang);
+            ld.p2.x = oracle::CX + r2 * cosf(ang); ld.p2.y = oracle::CY + r2 * sinf(ang);
+            lv_draw_line(&layer, &ld);
+          }
+
+          // moon glyph (phase approximated by an offset shadow disc)
+          {
+            int mx = 240, my = 120, R = 36;
+            rd.bg_color = lv_color_hex(0xE8E2C8); rd.bg_opa = 30;
+            lv_area_t gg = {mx - R - 6, my - R - 6, mx + R + 6, my + R + 6};
+            lv_draw_rect(&layer, &rd, &gg);
+            rd.bg_color = lv_color_hex(0xE8E2C8); rd.bg_opa = LV_OPA_COVER;
+            lv_area_t md = {mx - R, my - R, mx + R, my + R};
+            lv_draw_rect(&layer, &rd, &md);
+            rd.bg_color = lv_color_hex(0xC9C2A0); rd.bg_opa = 120;  // craters
+            lv_area_t c1 = {mx - 12, my - 10, mx - 4, my - 2};
+            lv_draw_rect(&layer, &rd, &c1);
+            lv_area_t c2 = {mx + 4, my + 4, mx + 12, my + 12};
+            lv_draw_rect(&layer, &rd, &c2);
+            float illum = id(oracle_trend_phase);
+            if (illum < 0.05f) illum = 0.05f; if (illum > 0.95f) illum = 0.95f;
+            int sgn = (id(oracle_trend_delta) >= 0) ? 1 : -1;  // waxing lit right
+            int dx = (int)(illum * 2.0f * R) * sgn;
+            rd.bg_color = lv_color_hex(${c_ink}); rd.bg_opa = LV_OPA_COVER;
+            lv_area_t sh = {mx - R + dx, my - R, mx + R + dx, my + R};
+            lv_draw_rect(&layer, &rd, &sh);
+          }
+          lv_canvas_finish_layer(cv, &layer);
+          lv_obj_invalidate(cv);
+
+  # Ephemeris labels: Roman date, day total, trend line, and the six readings.
+  - id: refresh_ephemeris
+    mode: restart
+    then:
+      - lambda: |-
+          static const char *MON[] = {"", "JANUARY", "FEBRUARY", "MARCH", "APRIL",
+            "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"};
+          auto now = id(device_time).now();
+          char datebuf[56];
+          if (now.is_valid() && now.month >= 1 && now.month <= 12) {
+            snprintf(datebuf, sizeof(datebuf), "%s · %s · %s",
+                     oracle_roman(now.day_of_month).c_str(), MON[now.month],
+                     oracle_roman(now.year).c_str());
+          } else {
+            snprintf(datebuf, sizeof(datebuf), "EPHEMERIS");
+          }
+          lv_label_set_text(id(e_date), datebuf);
+
+          lv_label_set_text(id(e_total), oracle_fmt_compact(id(oracle_today_total)).c_str());
+
+          int dp = id(oracle_trend_delta);
+          char tb[64];
+          snprintf(tb, sizeof(tb), "%s %s%d%% %s",
+                   dp >= 0 ? "WAXING" : "WANING", dp >= 0 ? "+" : "-",
+                   dp < 0 ? -dp : dp, dp >= 0 ? "ABOVE MEAN" : "BELOW MEAN");
+          lv_label_set_text(id(e_trend), tb);
+          lv_obj_set_style_text_color(id(e_trend), lv_color_hex(${c_gold}), LV_PART_MAIN);
+
+          lv_label_set_text(id(e_inv_v), oracle_fmt_compact(id(oracle_requests)).c_str());
+          lv_label_set_text(id(e_bal_v), oracle_ratio(id(oracle_prompt), id(oracle_completion)).c_str());
+
+          char dd[28];
+          snprintf(dd, sizeof(dd), "%s-%s", id(oracle_span_first).c_str(), id(oracle_span_last).c_str());
+          lv_label_set_text(id(e_dwn_v), dd);
+
+          char zb[32];
+          int zh = id(oracle_zenith_hour);
+          if (zh >= 0)
+            snprintf(zb, sizeof(zb), "%02d:00 %s", zh, oracle_fmt_compact(id(oracle_zenith_tokens)).c_str());
+          else
+            snprintf(zb, sizeof(zb), "--");
+          lv_label_set_text(id(e_zen_v), zb);
+
+          // REIGNING = the live ascendant (verdigris) if anything is generating
+          // right now; otherwise the day's most-tribute god (gold, not live).
+          auto gname = [](int g) -> const char * {
+            switch (g) {
+              case 1: return "MNEMOSYNE"; case 2: return "ATHENA"; case 3: return "METIS";
+              case 4: return "NYX"; case 5: return "THESEUS";
+            }
+            return "NONE";
+          };
+          int asc = id(oracle_ascendant);
+          bool live = (asc != 0);
+          int reign = asc;
+          if (!live) {
+            int cand[5] = {1, 2, 3, 4, 5};
+            uint64_t vals[5] = {id(oracle_tot_mnemosyne), id(oracle_tot_athena),
+              id(oracle_tot_metis), id(oracle_tot_nyx), id(oracle_tot_theseus)};
+            uint64_t best = 0; reign = 0;
+            for (int i = 0; i < 5; i++) if (vals[i] > best) { best = vals[i]; reign = cand[i]; }
+          }
+          lv_label_set_text(id(e_rgn_v), gname(reign));
+          lv_obj_set_style_text_color(id(e_rgn_v),
+            lv_color_hex(reign ? ${c_gold_bright} : ${c_gold_dim}), LV_PART_MAIN);
+
+          lv_label_set_text(id(e_hi_v), oracle_fmt_compact(id(oracle_high_water)).c_str());
+
+interval:
+  # Animation tick (~10fps). Only the active face re-renders; the calm motion
+  # (drift, twinkle, anchor pulse) lives in each face's render script. fps is
+  # the first dial to lower if any flicker appears under continuous animation.
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            lambda: "return id(current_face) == 0;"
+          then:
+            - script.execute: render_sky
+      - if:
+          condition:
+            lambda: "return id(current_face) == 1;"
+          then:
+            - script.execute: render_pantheon
+      - if:
+          condition:
+            lambda: "return id(current_face) == 2;"
+          then:
+            - script.execute: render_ephemeris
+
+  - interval: ${poll_interval}
+    then:
+      - http_request.get:
+          url: "http://${metrics_host}:${metrics_port}${metrics_path}"
+          capture_response: true
+          max_response_buffer_size: 4096
+          on_response:
+            then:
+              - lambda: |-
+                  id(oracle_last_http_status) = response->status_code;
+
+                  auto now = id(device_time).now();
+                  char update_buf[32];
+                  if (now.is_valid()) {
+                    snprintf(update_buf, sizeof(update_buf), "%02d:%02d:%02d", now.hour, now.minute, now.second);
+                  } else {
+                    snprintf(update_buf, sizeof(update_buf), "uptime %lus", (unsigned long) (millis() / 1000UL));
+                  }
+                  id(oracle_last_update) = update_buf;
+
+                  if (response->status_code != 200) {
+                    id(oracle_connected) = false;
+                    ESP_LOGW("token_oracle", "Metrics request returned HTTP %d", response->status_code);
+                    if (
+                      !id(oracle_have_rendered_metrics) ||
+                      id(oracle_rendered_connected) != id(oracle_connected) ||
+                      id(oracle_rendered_http_status) != id(oracle_last_http_status)
+                    ) {
+                      id(oracle_have_rendered_metrics) = true;
+                      id(oracle_rendered_connected) = id(oracle_connected);
+                      id(oracle_rendered_http_status) = id(oracle_last_http_status);
+                      id(oracle_rendered_today_total) = id(oracle_today_total);
+                      id(refresh_oracle_labels).execute();
+                    }
+                    return;
+                  }
+
+                  const bool parsed = json::parse_json(body, [](JsonObject root) -> bool {
+                    if (!root["today"].is<JsonObject>()) {
+                      ESP_LOGW("token_oracle", "Metrics payload missing today object");
+                      id(oracle_connected) = false;
+                      return false;
+                    }
+
+                    JsonObject today = root["today"].as<JsonObject>();
+                    if (!today["total"].is<uint64_t>()) {
+                      ESP_LOGW("token_oracle", "Metrics payload missing today.total");
+                      id(oracle_connected) = false;
+                      return false;
+                    }
+
+                    id(oracle_today_total) = today["total"].as<uint64_t>();
+                    id(oracle_prompt) = today["prompt"] | (uint64_t) 0;
+                    id(oracle_completion) = today["completion"] | (uint64_t) 0;
+                    id(oracle_requests) = today["requests"] | (uint64_t) 0;
+
+                    // per-node totals (matched by name; unknown nodes ignored)
+                    id(oracle_tot_nyx) = 0; id(oracle_tot_mnemosyne) = 0;
+                    id(oracle_tot_athena) = 0; id(oracle_tot_metis) = 0;
+                    id(oracle_tot_theseus) = 0;
+                    for (JsonObject n : root["nodes"].as<JsonArray>()) {
+                      const char *nm = n["name"] | "";
+                      uint64_t tv = n["total"] | (uint64_t) 0;
+                      if (!strcmp(nm, "nyx")) id(oracle_tot_nyx) = tv;
+                      else if (!strcmp(nm, "mnemosyne")) id(oracle_tot_mnemosyne) = tv;
+                      else if (!strcmp(nm, "athena")) id(oracle_tot_athena) = tv;
+                      else if (!strcmp(nm, "metis")) id(oracle_tot_metis) = tv;
+                      else if (!strcmp(nm, "theseus")) id(oracle_tot_theseus) = tv;
+                    }
+
+                    // ascendant name -> god code (0 none)
+                    const char *asc = root["ascendant"] | "";
+                    int code = 0;
+                    if (!strcmp(asc, "mnemosyne")) code = 1;
+                    else if (!strcmp(asc, "athena")) code = 2;
+                    else if (!strcmp(asc, "metis")) code = 3;
+                    else if (!strcmp(asc, "nyx")) code = 4;
+                    else if (!strcmp(asc, "theseus")) code = 5;
+                    id(oracle_ascendant) = code;
+
+                    JsonObject zen = root["zenith"];
+                    id(oracle_zenith_hour) = zen["hour"] | -1;
+                    id(oracle_zenith_tokens) = zen["tokens"] | (uint64_t) 0;
+                    JsonObject span = root["span"];
+                    id(oracle_span_first) = (const char *) (span["first"] | "--:--");
+                    id(oracle_span_last) = (const char *) (span["last"] | "--:--");
+                    JsonObject tr = root["trend"];
+                    id(oracle_trend_mean) = tr["mean"] | (uint64_t) 0;
+                    id(oracle_trend_delta) = tr["delta_pct"] | 0;
+                    id(oracle_trend_phase) = tr["phase"] | 0.5f;
+                    id(oracle_high_water) = root["high_water"] | (uint64_t) 0;
+
+                    id(oracle_connected) = root["ok"].as<bool>();
+                    return true;
+                  });
+
+                  if (!parsed) {
+                    id(oracle_connected) = false;
+                  }
+                  if (
+                    !id(oracle_have_rendered_metrics) ||
+                    id(oracle_rendered_connected) != id(oracle_connected) ||
+                    id(oracle_rendered_http_status) != id(oracle_last_http_status) ||
+                    id(oracle_rendered_today_total) != id(oracle_today_total)
+                  ) {
+                    id(oracle_have_rendered_metrics) = true;
+                    id(oracle_rendered_connected) = id(oracle_connected);
+                    id(oracle_rendered_http_status) = id(oracle_last_http_status);
+                    id(oracle_rendered_today_total) = id(oracle_today_total);
+                    id(refresh_oracle_labels).execute();
+                    id(refresh_pantheon).execute();
+                    id(refresh_ephemeris).execute();
+                  }
+                  ESP_LOGI(
+                    "token_oracle",
+                    "metrics parsed=%s http=%d total=%llu",
+                    parsed ? "true" : "false",
+                    id(oracle_last_http_status),
+                    (unsigned long long) id(oracle_today_total)
+                  );
+          on_error:
+            then:
+              - lambda: |-
+                  id(oracle_connected) = false;
+                  id(oracle_last_http_status) = -1;
+                  id(oracle_last_update) = "request error";
+                  ESP_LOGW("token_oracle", "Metrics request failed");
+                  if (
+                    !id(oracle_have_rendered_metrics) ||
+                    id(oracle_rendered_connected) != id(oracle_connected) ||
+                    id(oracle_rendered_http_status) != id(oracle_last_http_status)
+                  ) {
+                    id(oracle_have_rendered_metrics) = true;
+                    id(oracle_rendered_connected) = id(oracle_connected);
+                    id(oracle_rendered_http_status) = id(oracle_last_http_status);
+                    id(oracle_rendered_today_total) = id(oracle_today_total);
+                    id(refresh_oracle_labels).execute();
+                  }

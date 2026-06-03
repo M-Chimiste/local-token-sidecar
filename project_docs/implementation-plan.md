@@ -35,14 +35,21 @@ pca9554:    address 0x20  (LCD CS=#2, LCD RESET=#0, TOUCH RESET=#1)
 spi (lcd):  clk=GPIO02  mosi=GPIO01  interface=spi3
 backlight:  GPIO06 (LEDC, monochromatic light)
 display st7701s:
-  spi_mode MODE1, color_order BGR, 480x480
+  spi_mode MODE0, color_order BGR, 480x480
   de=GPIO40  hsync=GPIO38  vsync=GPIO39  pclk=GPIO41
-  data_pins: red=[46,3,8,18,17] green=[14,13,12,11,10,9] blue=[5,45,48,47,21]
-  (full ST7701S init_sequence is in the prior ESPHome draft / community config)
+  data_pins: [5,45,48,47,21,14,13,12,11,10,9,46,3,8,18,17]
+  pclk 12-18MHz under bring-up tuning; vendor demo uses 30MHz but flickered under ESPHome
+  full ST7701S init_sequence comes from the official Waveshare 2.8C demo
 touchscreen gt911:
   reset_pin = pca9554 #1   interrupt_pin = GPIO16
-esp32: board esp32-s3-devkitc-1, flash 8MB, framework esp-idf, psram octal@80MHz
+esp32: board esp32-s3-devkitc-1, flash 16MB, framework esp-idf, psram octal@80MHz
 ```
+
+Current Phase 1 display tuning uses a local ESPHome `st7701s` external
+component inspired by the verified Argus firmware: two RGB framebuffers and no
+continuous RGB panel restart from the component loop. This is an A/B bridge; if
+it remains visually unstable, consider moving the Oracle firmware toward the
+Argus ESP-IDF/manual LVGL display stack.
 
 > Only `substitutions` (nyx LAN IP, accent) and Wi-Fi `secrets` should
 > need editing. Flash once over USB, then OTA.

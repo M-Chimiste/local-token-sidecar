@@ -1,10 +1,10 @@
 proxy:
-  listen_host: "localhost"
+  listen_host: "0.0.0.0"
   listen_port: 1240          # sidecar binds here; forwards to LM Studio upstream_url
   upstream_url: "http://localhost:1234"
 
 node:
-  id: "athena"               # stable machine id for central reporting
+  id: "theseus"               # stable machine id for central reporting
 
 database:
   path: "~/.token_sidecar/tokens.db"
@@ -28,3 +28,17 @@ dashboard:
   listen_port: 8088
   feed_initial_rows: 50
   poll_interval_ms: 2200
+
+oracle:
+  enabled: false                 # postgres box only: Token Oracle metrics API
+  listen_host: "0.0.0.0"
+  listen_port: 8090
+  timezone: "America/New_York"
+  ascendant_window_seconds: 120
+  dsn_env: "TOKEN_SIDECAR_QUERY_DSN"
+  nodes:
+    - "nyx"
+    - "mnemosyne"
+    - "athena"
+    - "metis"
+    - "theseus"
