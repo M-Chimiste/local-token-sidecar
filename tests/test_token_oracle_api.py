@@ -148,6 +148,15 @@ class FakePool:
                     key=lambda item: (-item[1][1].timestamp(), item[0]),
                 )
             ]
+        if "oracle:node_models" in sql:
+            rows = self.in_range(params[0], params[1])
+            totals = {}
+            for row in rows:
+                key = (row["node_id"], row["model"])
+                totals[key] = totals.get(key, 0) + row["total_tokens"]
+            items = [(node, model, tokens) for (node, model), tokens in totals.items()]
+            items.sort(key=lambda it: (it[0], -it[2], it[1]))
+            return items
         if "oracle:models" in sql:
             start, end, node = params
             rows = [
@@ -245,10 +254,16 @@ async def test_metrics_stable_node_order_and_live_flag(client):
     nodes = (await r.json())["nodes"]
     assert [node["name"] for node in nodes] == ["nyx", "mnemosyne", "athena", "metis"]
     by_name = {node["name"]: node for node in nodes}
-    assert by_name["nyx"] == {"name": "nyx", "total": 100, "live": False}
-    assert by_name["mnemosyne"] == {"name": "mnemosyne", "total": 800, "live": True}
-    assert by_name["athena"] == {"name": "athena", "total": 200, "live": False}
-    assert by_name["metis"] == {"name": "metis", "total": 0, "live": False}
+    assert (by_name["nyx"]["total"], by_name["nyx"]["live"]) == (100, False)
+    assert (by_name["mnemosyne"]["total"], by_name["mnemosyne"]["live"]) == (800, True)
+    assert (by_name["athena"]["total"], by_name["athena"]["live"]) == (200, False)
+    assert (by_name["metis"]["total"], by_name["metis"]["live"]) == (0, False)
+    # each node now carries its own today model breakdown (top-N, tokens desc)
+    assert all(isinstance(node["models"], list) for node in nodes)
+    assert by_name["mnemosyne"]["models"] == [
+        {"name": "minimax", "total": 500},
+        {"name": "qwen", "total": 300},
+    ]
 
 
 async def test_node_totals_orders_by_aggregate_alias(client, fake_pool):

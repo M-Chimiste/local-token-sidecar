@@ -169,6 +169,21 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
 
             await cur.execute(
                 f"""
+                /* oracle:node_models */
+                SELECT node_id, model, COALESCE(SUM(total_tokens), 0)::bigint AS tokens
+                FROM token_usage
+                WHERE {PROBE_FILTER_SQL}
+                  AND timestamp >= %s
+                  AND timestamp < %s
+                GROUP BY node_id, model
+                ORDER BY node_id ASC, tokens DESC, model ASC
+                """,
+                [today_start, tomorrow_start],
+            )
+            node_model_rows = await cur.fetchall()
+
+            await cur.execute(
+                f"""
                 /* oracle:hourly */
                 SELECT
                     EXTRACT(HOUR FROM timestamp AT TIME ZONE %s)::integer AS hour_local,
@@ -279,7 +294,7 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
             {"name": str(model), "total": int(tokens or 0)}
             for model, tokens in model_rows
         ],
-        "nodes": _nodes(cfg.nodes, node_rows, live_nodes),
+        "nodes": _nodes(cfg.nodes, node_rows, live_nodes, _node_models(node_model_rows)),
         "hourly": hourly,
         "trend": trend,
         "high_water": high_water,
@@ -299,7 +314,7 @@ def default_metrics(cfg: OracleConfig, now: datetime, ok: bool) -> dict[str, Any
         "zenith": {"hour": None, "tokens": 0},
         "span": {"first": None, "last": None},
         "models": [],
-        "nodes": [{"name": node, "total": 0, "live": False} for node in cfg.nodes],
+        "nodes": [{"name": node, "total": 0, "live": False, "models": []} for node in cfg.nodes],
         "hourly": [0] * 24,
         "trend": {"mean": 0, "delta_pct": 0, "phase": 0.5},
         "high_water": 0,
@@ -344,16 +359,36 @@ def _time_label(value) -> str:
     return str(value)[:5]
 
 
-def _nodes(configured: tuple[str, ...], rows: list[tuple], live_nodes: set[str]) -> list[dict[str, Any]]:
+def _nodes(
+    configured: tuple[str, ...],
+    rows: list[tuple],
+    live_nodes: set[str],
+    node_models: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
     totals = {str(node): int(tokens or 0) for node, tokens in rows}
     names: list[str] = list(configured)
     for name in sorted(set(totals) | live_nodes):
         if name not in names:
             names.append(name)
     return [
-        {"name": name, "total": totals.get(name, 0), "live": name in live_nodes}
+        {
+            "name": name,
+            "total": totals.get(name, 0),
+            "live": name in live_nodes,
+            "models": node_models.get(name, []),
+        }
         for name in names
     ]
+
+
+def _node_models(rows: list[tuple], limit: int = 5) -> dict[str, list[dict[str, Any]]]:
+    """Top-`limit` models per node (rows pre-sorted node ASC, tokens DESC)."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for node, model, tokens in rows:
+        bucket = out.setdefault(str(node), [])
+        if len(bucket) < limit:
+            bucket.append({"name": str(model), "total": int(tokens or 0)})
+    return out
 
 
 def _daily_totals(rows: list[tuple]) -> dict[date, int]:

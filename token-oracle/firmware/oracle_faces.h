@@ -43,10 +43,11 @@ inline const char *god_name(int g) {
   return "NONE";
 }
 
-// Ascendant drill-in: the live god's models (parsed from /metrics models[]).
+// Per-god model breakdown (today), parsed from /metrics nodes[].models. Indexed
+// by god code (1..5); index 0 unused. Drives the drill-in for any constellation.
 struct ModelStar { char name[24]; uint64_t total; };
-inline ModelStar g_models[8];
-inline int g_model_count = 0;
+inline ModelStar g_node_models[6][8];
+inline int g_node_model_count[6] = {0, 0, 0, 0, 0, 0};
 
 // ---- background starfield (rotates as one field; ~280s/turn) ----
 struct BgStar {
@@ -141,19 +142,20 @@ constexpr int N_RINGS = 5;
 constexpr int ARC_START_DEG = 270;    // tribute arcs sweep clockwise from top
 constexpr float ARC_MAX_DEG = 300.0f; // max sweep at the leading god
 
-// Centroid of a god's constellation (for tap hit-testing on the Night Sky).
-// Returns false if that god has no constellation.
-inline bool constellation_centroid(int god, float &cx, float &cy) {
+// God code of the constellation whose centroid is nearest (x,y) within maxdist,
+// or 0 if none. Used to hit-test a tap against any constellation on the Night Sky.
+inline int constellation_at(float x, float y, float maxdist) {
+  int best = 0;
+  float best_d2 = maxdist * maxdist;
   for (int c = 0; c < N_CONSTELLATIONS; c++) {
-    if (CONSTELLATIONS[c].god != god) continue;
     const Constellation &cn = CONSTELLATIONS[c];
     float sx = 0, sy = 0;
     for (int i = 0; i < cn.nstars; i++) { sx += cn.stars[i].x; sy += cn.stars[i].y; }
-    cx = sx / cn.nstars;
-    cy = sy / cn.nstars;
-    return true;
+    float cx = sx / cn.nstars, cy = sy / cn.nstars;
+    float dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+    if (d2 < best_d2) { best_d2 = d2; best = cn.god; }
   }
-  return false;
+  return best;
 }
 
 // polar -> cartesian, 0deg = up/north (matches the mockup's pt()).
