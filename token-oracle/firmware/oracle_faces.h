@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 
 namespace oracle {
 
@@ -19,6 +20,33 @@ constexpr int BG_STARS = 96;
 // God codes used across faces and globals: matches node_id names.
 enum God { GOD_NONE = 0, GOD_MNEMOSYNE = 1, GOD_ATHENA = 2, GOD_METIS = 3,
            GOD_NYX = 4, GOD_THESEUS = 5 };
+
+inline uint32_t god_color(int g) {
+  switch (g) {
+    case GOD_NYX: return 0xF3ECCF;
+    case GOD_MNEMOSYNE: return 0x46C2A6;
+    case GOD_ATHENA: return 0xC9A24B;
+    case GOD_METIS: return 0xC678DD;
+    case GOD_THESEUS: return 0x6FB7E0;
+  }
+  return 0xF3DA94;
+}
+
+inline const char *god_name(int g) {
+  switch (g) {
+    case GOD_NYX: return "NYX";
+    case GOD_MNEMOSYNE: return "MNEMOSYNE";
+    case GOD_ATHENA: return "ATHENA";
+    case GOD_METIS: return "METIS";
+    case GOD_THESEUS: return "THESEUS";
+  }
+  return "NONE";
+}
+
+// Ascendant drill-in: the live god's models (parsed from /metrics models[]).
+struct ModelStar { char name[24]; uint64_t total; };
+inline ModelStar g_models[8];
+inline int g_model_count = 0;
 
 // ---- background starfield (rotates as one field; ~280s/turn) ----
 struct BgStar {
@@ -112,6 +140,21 @@ static const Ring RINGS[] = {
 constexpr int N_RINGS = 5;
 constexpr int ARC_START_DEG = 270;    // tribute arcs sweep clockwise from top
 constexpr float ARC_MAX_DEG = 300.0f; // max sweep at the leading god
+
+// Centroid of a god's constellation (for tap hit-testing on the Night Sky).
+// Returns false if that god has no constellation.
+inline bool constellation_centroid(int god, float &cx, float &cy) {
+  for (int c = 0; c < N_CONSTELLATIONS; c++) {
+    if (CONSTELLATIONS[c].god != god) continue;
+    const Constellation &cn = CONSTELLATIONS[c];
+    float sx = 0, sy = 0;
+    for (int i = 0; i < cn.nstars; i++) { sx += cn.stars[i].x; sy += cn.stars[i].y; }
+    cx = sx / cn.nstars;
+    cy = sy / cn.nstars;
+    return true;
+  }
+  return false;
+}
 
 // polar -> cartesian, 0deg = up/north (matches the mockup's pt()).
 inline void pt(float r, float deg, float &x, float &y) {

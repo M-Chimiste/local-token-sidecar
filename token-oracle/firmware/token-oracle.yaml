@@ -16,11 +16,16 @@ substitutions:
   c_verdigris_pale: "0xA8ECDB" # RESERVED: non-live constellation accents
   c_text_dim: "0x9A8F6B"      # captions
 
+  # Backlight levels for motion-wake / auto-dim (0.0-1.0)
+  bl_full: "0.70"             # awake (on pickup / motion)
+  bl_dim: "0.12"              # calm at-rest level after idle
+  idle_timeout: 90s           # time after last motion before dimming
+
 external_components:
   - source:
       type: local
       path: components
-    components: [st7701s]
+    components: [st7701s, qmi8658]
 
 esphome:
   name: ${device_name}
@@ -37,8 +42,9 @@ esphome:
     then:
       - light.turn_on:
           id: display_backlight
-          brightness: 55%
+          brightness: ${bl_full}
       - script.execute: refresh_oracle_labels
+      - script.execute: idle_dim
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -94,6 +100,17 @@ time:
   - platform: sntp
     id: device_time
     timezone: America/New_York
+    on_time:
+      # Midnight reckoning: hold the finished day's Ephemeris. Its on_load sets
+      # current_face/pager and refreshes. Normal paging resumes on next touch.
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lvgl.page.show:
+              id: ephemeris
+              animation: FADE_IN
+              time: 400ms
 
 json:
 
@@ -145,11 +162,11 @@ font:
   - file: "gfonts://Cinzel"
     id: cinzel_28
     size: 28
-    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%"
+    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%/"
   - file: "gfonts://Cinzel"
     id: cinzel_14
     size: 14
-    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%"
+    glyphs: "ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789·:.-()+%/"
   - file: "gfonts://Cormorant@600"
     id: cormorant_48
     size: 48
@@ -383,17 +400,82 @@ touchscreen:
     # non-linearity. The pager dot follows via each page's on_load.
     on_touch:
       then:
+        - lambda: |-
+            float cx = -1, cy = -1;
+            bool has = oracle::constellation_centroid(id(oracle_ascendant), cx, cy);
+            float d = (has) ? sqrtf((touch.x - cx) * (touch.x - cx) + (touch.y - cy) * (touch.y - cy)) : -1;
+            ESP_LOGI("oracle_touch",
+                     "x=%d y=%d face=%d asc=%d models=%d centroid=(%.0f,%.0f) dist=%.0f",
+                     touch.x, touch.y, id(current_face), id(oracle_ascendant),
+                     oracle::g_model_count, cx, cy, d);
         - if:
             condition:
-              lambda: "return touch.x < 134;"
+              # On the drill-in page, any tap returns to the Night Sky.
+              lambda: "return id(current_face) == 3;"
             then:
-              - lvgl.page.previous:
-                  animation: OVER_RIGHT
+              - lvgl.page.show:
+                  id: night_sky
+                  animation: FADE_OUT
                   time: 250ms
             else:
-              - lvgl.page.next:
-                  animation: OVER_LEFT
-                  time: 250ms
+              - if:
+                  condition:
+                    # Tapping the live (verdigris) constellation on the Night Sky
+                    # drills into that god's models.
+                    lambda: |-
+                      if (id(current_face) != 0 || id(oracle_ascendant) == 0 ||
+                          oracle::g_model_count == 0)
+                        return false;
+                      float cx, cy;
+                      if (!oracle::constellation_centroid(id(oracle_ascendant), cx, cy))
+                        return false;
+                      float dx = touch.x - cx, dy = touch.y - cy;
+                      return (dx * dx + dy * dy) < (90.0f * 90.0f);
+                  then:
+                    - lvgl.page.show:
+                        id: ascendant_drill
+                        animation: FADE_IN
+                        time: 250ms
+                  else:
+                    - if:
+                        condition:
+                          lambda: "return touch.x < 134;"
+                        then:
+                          - lvgl.page.previous:
+                              animation: OVER_RIGHT
+                              time: 250ms
+                        else:
+                          - lvgl.page.next:
+                              animation: OVER_LEFT
+                              time: 250ms
+
+# QMI8658 IMU on the shared bus (0x6B). `moving` drives motion-wake/auto-dim.
+# debug:true logs accel ~1/s for the one-time axis-sign calibration.
+qmi8658:
+  id: oracle_imu
+  i2c_id: i2c_bus
+  address: 0x6B
+  update_interval: 50ms
+  debug: true
+  moving:
+    id: imu_moving
+    name: "Oracle Moving"
+    on_press:
+      # picked up / in motion -> wake to full, cancel any pending dim
+      - script.stop: idle_dim
+      - light.turn_on:
+          id: display_backlight
+          brightness: ${bl_full}
+          transition_length: 500ms
+    on_release:
+      # motion stopped -> start the idle countdown to dim
+      - script.execute: idle_dim
+  face_down:
+    id: imu_face_down
+    name: "Oracle Face Down"
+  accel_magnitude:
+    id: imu_accel_mag
+    name: "Oracle Accel Magnitude"
 
 lvgl:
   displays:
@@ -794,6 +876,48 @@ lvgl:
             text_font: cormorant_20
             text_color: ${c_gold_bright}
 
+    # Ascendant drill-in (off-pager; reached by center-tapping the Night Sky when
+    # a god is live). Shows the reigning god's models as stars sized by tokens.
+    - id: ascendant_drill
+      bg_color: ${c_ink}
+      bg_opa: COVER
+      skip: true   # off-pager: only reached by tapping the live constellation
+      on_load:
+        then:
+          - lambda: "id(current_face) = 3;"
+          - script.execute: set_pager
+          - script.execute: render_drill
+          - script.execute: refresh_drill
+      widgets:
+        - canvas:
+            id: drill_canvas
+            width: 480
+            height: 480
+        - label:
+            id: d_god
+            align: CENTER
+            y: -12
+            text: NONE
+            text_font: cinzel_28
+            text_color: ${c_gold_bright}
+            text_align: CENTER
+        - label:
+            id: d_sub
+            align: CENTER
+            y: 16
+            text: ASCENDANT
+            styles: style_caption
+        - label: {id: d_m0_name, text: "", text_font: cinzel_14, text_color: 0xC9A24B}
+        - label: {id: d_m0_count, text: "", text_font: cormorant_20, text_color: 0xF3DA94}
+        - label: {id: d_m1_name, text: "", text_font: cinzel_14, text_color: 0xC9A24B}
+        - label: {id: d_m1_count, text: "", text_font: cormorant_20, text_color: 0xF3DA94}
+        - label: {id: d_m2_name, text: "", text_font: cinzel_14, text_color: 0xC9A24B}
+        - label: {id: d_m2_count, text: "", text_font: cormorant_20, text_color: 0xF3DA94}
+        - label: {id: d_m3_name, text: "", text_font: cinzel_14, text_color: 0xC9A24B}
+        - label: {id: d_m3_count, text: "", text_font: cormorant_20, text_color: 0xF3DA94}
+        - label: {id: d_m4_name, text: "", text_font: cinzel_14, text_color: 0xC9A24B}
+        - label: {id: d_m4_count, text: "", text_font: cormorant_20, text_color: 0xF3DA94}
+
 script:
   # Canonical JSON->globals->refresh render step. Phase 3 faces extend this:
   # parse a /metrics field into a global (interval below), delta-check it, then
@@ -831,6 +955,18 @@ script:
           lv_obj_set_style_bg_color(id(dot_0), f == 0 ? on : off, LV_PART_MAIN);
           lv_obj_set_style_bg_color(id(dot_1), f == 1 ? on : off, LV_PART_MAIN);
           lv_obj_set_style_bg_color(id(dot_2), f == 2 ? on : off, LV_PART_MAIN);
+
+  # Auto-dim: after the device has been still for idle_timeout, fade the
+  # backlight to the calm at-rest level. mode:restart so renewed motion (which
+  # re-runs this) or a wake (script.stop) cancels the pending dim.
+  - id: idle_dim
+    mode: restart
+    then:
+      - delay: ${idle_timeout}
+      - light.turn_on:
+          id: display_backlight
+          brightness: ${bl_dim}
+          transition_length: 2000ms
 
   # Night Sky renderer: draws the whole face into sky_canvas via the LVGL 9
   # layer API. Time-based so it animates when called on an interval; rendering
@@ -874,9 +1010,10 @@ script:
           lv_draw_line_dsc_init(&ld);
           for (int c = 0; c < oracle::N_CONSTELLATIONS; c++) {
             const oracle::Constellation &cn = oracle::CONSTELLATIONS[c];
+            bool live = (cn.god == id(oracle_ascendant));  // the ascendant = tappable
             ld.color = lv_color_hex(cn.color);
-            ld.width = 1;
-            ld.opa = 110;
+            ld.width = live ? 2 : 1;
+            ld.opa = live ? 150 : 110;
             for (int e = 0; e < cn.nedges; e++) {
               const oracle::CStar &s1 = cn.stars[cn.edges[e].a];
               const oracle::CStar &s2 = cn.stars[cn.edges[e].b];
@@ -887,13 +1024,22 @@ script:
             for (int si = 0; si < cn.nstars; si++) {
               const oracle::CStar &s = cn.stars[si];
               int r = (int)(1.7f + s.mag * 2.6f + (s.anchor ? 1.0f : 0.0f) + 0.5f);
-              if (s.anchor) r += (int)(1.4f * (0.5f + 0.5f * sinf(t * 2.6f)));
+              // only the live god's anchor pulses (the tappable drill target)
+              if (s.anchor && live) r += (int)(1.6f * (0.5f + 0.5f * sinf(t * 2.6f)));
               if (s.anchor) {  // soft halo on the anchor star
                 rd.bg_color = lv_color_hex(cn.color);
                 rd.bg_opa = 45;
                 int gr = r * 3;
                 lv_area_t ga = {(int)s.x - gr, (int)s.y - gr, (int)s.x + gr, (int)s.y + gr};
                 lv_draw_rect(&layer, &rd, &ga);
+                if (live) {  // verdigris "alive" pulse marks the tappable god
+                  float lp = 0.5f + 0.5f * sinf(t * 2.4f);
+                  rd.bg_color = lv_color_hex(${c_verdigris});
+                  rd.bg_opa = (lv_opa_t)(60 + lp * 90);
+                  int vr = r * 2;
+                  lv_area_t va = {(int)s.x - vr, (int)s.y - vr, (int)s.x + vr, (int)s.y + vr};
+                  lv_draw_rect(&layer, &rd, &va);
+                }
               }
               rd.bg_color = lv_color_hex(cn.color);
               rd.bg_opa = LV_OPA_COVER;
@@ -1162,6 +1308,103 @@ script:
 
           lv_label_set_text(id(e_hi_v), oracle_fmt_compact(id(oracle_high_water)).c_str());
 
+  # Ascendant drill-in canvas: faint starfield + the live god's anchor (verdigris
+  # core = alive) with its models as stars sized by token share around a ring.
+  - id: render_drill
+    mode: restart
+    then:
+      - lambda: |-
+          lv_obj_t *cv = id(drill_canvas);
+          lv_canvas_fill_bg(cv, lv_color_hex(${c_ink}), LV_OPA_COVER);
+          lv_layer_t layer;
+          lv_canvas_init_layer(cv, &layer);
+          const float t = millis() / 1000.0f;
+          const float rot = fmodf(t * (360.0f / 280.0f), 360.0f);
+
+          lv_draw_rect_dsc_t rd;
+          lv_draw_rect_dsc_init(&rd);
+          rd.radius = LV_RADIUS_CIRCLE;
+          rd.border_width = 0;
+
+          static oracle::BgStar bg[oracle::BG_STARS];
+          static bool dbg = false;
+          if (!dbg) { oracle::bg_init(bg, oracle::BG_STARS); dbg = true; }
+          for (int i = 0; i < oracle::BG_STARS; i++) {
+            float x, y;
+            oracle::pt(bg[i].rad, bg[i].ang_deg + rot, x, y);
+            float k = 1.0f;
+            if (bg[i].twinkles) k = 0.55f + 0.45f * sinf(t * bg[i].tw_speed + bg[i].tw_phase);
+            if (k < 0) k = 0; if (k > 1) k = 1;
+            rd.bg_color = lv_color_hex(bg[i].warm ? 0xF3ECCF : 0xCFE0FF);
+            rd.bg_opa = (lv_opa_t)(15 + k * 55);
+            int r = (int)(bg[i].size + 0.5f); if (r < 1) r = 1;
+            lv_area_t a = {(int)x - r, (int)y - r, (int)x + r, (int)y + r};
+            lv_draw_rect(&layer, &rd, &a);
+          }
+
+          uint32_t gc = oracle::god_color(id(oracle_ascendant));
+          int n = oracle::g_model_count; if (n > 5) n = 5;
+          uint64_t mx = 1;
+          for (int i = 0; i < n; i++) if (oracle::g_models[i].total > mx) mx = oracle::g_models[i].total;
+
+          lv_draw_line_dsc_t ld;
+          lv_draw_line_dsc_init(&ld);
+          ld.color = lv_color_hex(gc); ld.width = 1; ld.opa = 70;
+          for (int i = 0; i < n; i++) {
+            float ang = (-90.0f + 360.0f * i / n) * 0.0174533f;
+            int x = 240 + (int)(145 * cosf(ang)), y = 240 + (int)(145 * sinf(ang));
+            ld.p1.x = 240; ld.p1.y = 240; ld.p2.x = x; ld.p2.y = y;
+            lv_draw_line(&layer, &ld);
+            float share = (float)oracle::g_models[i].total / (float)mx;
+            int r = 3 + (int)(share * 7.0f);
+            rd.bg_color = lv_color_hex(gc); rd.bg_opa = 60;
+            int gr = r * 2; lv_area_t ga = {x - gr, y - gr, x + gr, y + gr};
+            lv_draw_rect(&layer, &rd, &ga);
+            rd.bg_opa = LV_OPA_COVER;
+            lv_area_t a = {x - r, y - r, x + r, y + r};
+            lv_draw_rect(&layer, &rd, &a);
+          }
+
+          // soft verdigris glow behind the centered god name (it is alive)
+          float pulse = 0.6f + 0.4f * sinf(t * 1.9f);
+          rd.bg_color = lv_color_hex(${c_verdigris});
+          rd.bg_opa = (lv_opa_t)(35 * pulse);
+          lv_area_t h = {240 - 30, 240 - 30, 240 + 30, 240 + 30};
+          lv_draw_rect(&layer, &rd, &h);
+
+          lv_canvas_finish_layer(cv, &layer);
+          lv_obj_invalidate(cv);
+
+  # Drill-in labels: god name + each model's (uppercased) name & count at its star.
+  - id: refresh_drill
+    mode: restart
+    then:
+      - lambda: |-
+          int gcode = id(oracle_ascendant);
+          lv_label_set_text(id(d_god), oracle::god_name(gcode));
+          lv_obj_set_style_text_color(id(d_god), lv_color_hex(oracle::god_color(gcode)), LV_PART_MAIN);
+          lv_obj_t *names[5] = {id(d_m0_name), id(d_m1_name), id(d_m2_name), id(d_m3_name), id(d_m4_name)};
+          lv_obj_t *counts[5] = {id(d_m0_count), id(d_m1_count), id(d_m2_count), id(d_m3_count), id(d_m4_count)};
+          int n = oracle::g_model_count; if (n > 5) n = 5;
+          for (int i = 0; i < 5; i++) {
+            if (i < n) {
+              char up[24];
+              const char *s = oracle::g_models[i].name;
+              int j = 0;
+              for (; s[j] && j < 23; j++) { char c = s[j]; up[j] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+              up[j] = '\0';
+              float ang = (-90.0f + 360.0f * i / n) * 0.0174533f;
+              int x = 240 + (int)(145 * cosf(ang)), y = 240 + (int)(145 * sinf(ang));
+              lv_label_set_text(names[i], up);
+              lv_label_set_text(counts[i], oracle_fmt_compact(oracle::g_models[i].total).c_str());
+              lv_obj_set_pos(names[i], x - 30, y - 26);
+              lv_obj_set_pos(counts[i], x - 18, y - 8);
+            } else {
+              lv_label_set_text(names[i], "");
+              lv_label_set_text(counts[i], "");
+            }
+          }
+
 interval:
   # Animation tick (~10fps). Only the active face re-renders; the calm motion
   # (drift, twinkle, anchor pulse) lives in each face's render script. fps is
@@ -1183,6 +1426,11 @@ interval:
             lambda: "return id(current_face) == 2;"
           then:
             - script.execute: render_ephemeris
+      - if:
+          condition:
+            lambda: "return id(current_face) == 3;"
+          then:
+            - script.execute: render_drill
 
   - interval: ${poll_interval}
     then:
@@ -1264,6 +1512,17 @@ interval:
                     else if (!strcmp(asc, "theseus")) code = 5;
                     id(oracle_ascendant) = code;
 
+                    // ascendant's models -> drill-in table (uppercased at render)
+                    oracle::g_model_count = 0;
+                    for (JsonObject m : root["models"].as<JsonArray>()) {
+                      if (oracle::g_model_count >= 8) break;
+                      const char *mn = m["name"] | "";
+                      strncpy(oracle::g_models[oracle::g_model_count].name, mn, 23);
+                      oracle::g_models[oracle::g_model_count].name[23] = '\0';
+                      oracle::g_models[oracle::g_model_count].total = m["total"] | (uint64_t) 0;
+                      oracle::g_model_count++;
+                    }
+
                     JsonObject zen = root["zenith"];
                     id(oracle_zenith_hour) = zen["hour"] | -1;
                     id(oracle_zenith_tokens) = zen["tokens"] | (uint64_t) 0;
@@ -1296,6 +1555,7 @@ interval:
                     id(refresh_oracle_labels).execute();
                     id(refresh_pantheon).execute();
                     id(refresh_ephemeris).execute();
+                    id(refresh_drill).execute();
                   }
                   ESP_LOGI(
                     "token_oracle",
