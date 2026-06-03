@@ -5,17 +5,26 @@ The Waveshare ESP32-S3-Touch-LCD-2.8C renders fleet token usage as three faces �
 **Ephemeris** (daily reckoning) — navigated by edge-tap with a dot pager. Each
 face is an LVGL `lv_canvas` drawn by a per-frame C++ lambda from the geometry in
 `oracle_faces.h`, bound to live `/metrics` data via the JSON→globals→refresh
-pattern. Phases 0–3 are done; Phase 4 (IMU interaction) and Phase 5 (polish) remain.
+pattern. Phases 0–4 are done (faces + IMU interaction); Phase 5 (polish) remains.
+
+Interaction: the QMI8658 IMU drives **motion-wake / auto-dim** (pick it up →
+full brightness; idle ~90s → calm dim). Tapping any **constellation** on the
+Night Sky **drills into that god's** today model breakdown; tap to return. At
+local **midnight** the device holds the finished Ephemeris.
 
 ## Files
 
-- `token-oracle.yaml` - ESPHome firmware (hardware block + the three faces).
+- `token-oracle.yaml` - ESPHome firmware (hardware block + the three faces + IMU).
 - `oracle_faces.h` - pure (LVGL-free) data/math: background starfield, the five
-  constellations + per-god colors, Pantheon rings, polar helpers.
+  constellations + per-god colors, Pantheon rings, polar/centroid helpers, and the
+  per-god model tables for the drill-in.
 - `token_dash_helpers.h` - pure C++ helpers (compact number, Roman numerals,
   prompt:completion ratio), pulled in via `esphome: includes:`.
 - `components/st7701s/` - local ESPHome display-driver override (double
   framebuffer + bounce buffer; the Argus-derived panel-stability fixes).
+- `components/qmi8658/` - local ESPHome IMU component (accel poll → `moving` /
+  `face_down` / `accel_magnitude`), ported from Argus `argus_input.c`. Pure I2C
+  at 0x6B; no INT/reset pins.
 - `secrets.example.yaml` - copy to `secrets.yaml` and fill in local values.
 - `.gitignore` - keeps ESPHome build output and secrets local.
 

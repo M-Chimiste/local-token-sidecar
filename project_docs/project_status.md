@@ -8,9 +8,10 @@
 
 ## Current Recommendation
 
-**Phases 0–3 are complete on hardware: all three faces render live `/metrics`
-data with calm motion, flicker-free. Next is Phase 4 (IMU interaction); Phase 5
-polish items are catalogued below.**
+**Phases 0–4 are complete on hardware. The three faces render live data with calm
+motion; the IMU drives motion-wake/auto-dim; tapping any constellation drills into
+that god's model breakdown; midnight holds the Ephemeris. Only Phase 5 polish
+remains (catalogued below).**
 
 Reason: The render path is proven — an LVGL `lv_canvas` per face is drawn by a
 single per-frame C++ lambda (LVGL 9 layer API) from pure geometry tables in
@@ -50,8 +51,8 @@ Deployment state:
 | 1 | Board bring-up | Validated | USB/OTA, Wi-Fi, touch, `/metrics`, stable display; flicker chain fully resolved |
 | 2 | Face framework | Validated on hardware | Palette tokens, Cinzel/Cormorant fonts, 3 navigable faces + dot pager, JSON→globals→refresh; fonts/paging/pager confirmed on glass; starfield deferred to P3 |
 | 3 | Three faces | Validated on hardware | Canvas render path; Night Sky/Pantheon/Ephemeris bind live per-node data + calm motion; colors corrected (RGB) |
-| 4 | Interaction | Touch done; IMU pending | Touch paging works (P2); remaining: QMI8658 motion-wake/auto-dim, tilt-to-scrub, Night Sky ascendant drill-in |
-| 5 | Polish | Not started | Real-panel color tuning, night auto-dim, midnight reckoning, true moon terminator, sigils, verdigris live-cue, Pantheon ghost orbits |
+| 4 | Interaction | Done on hardware | QMI8658 motion-wake/auto-dim, midnight reckoning, drill-in (tap any constellation → its model breakdown). Tilt-to-scrub deferred by choice |
+| 5 | Polish | Not started | Real-panel color tuning, night auto-dim refinement, true moon terminator, sigils, Pantheon ghost orbits, tilt-to-scrub (needs an hourly view) |
 
 ---
 
@@ -171,6 +172,40 @@ Hardware validation:
 ---
 
 ## Session Log
+
+### 2026-06-03 — Phase 4 Interaction (IMU, motion-wake, drill-in, midnight)
+
+- New `components/qmi8658/` ESPHome external component (mirrors `st7701s/`): polls
+  the QMI8658 accel at 0x6B (WHO_AM_I 0x05) over the shared I2C bus, ported from
+  Argus `argus_input.c` (CTRL1/2/5/7 config, ±4g, fast low-pass gravity → motion
+  deviation → `picked_up`). Exposes `moving`/`face_down` binary_sensors +
+  `accel_magnitude`. Resting values matched Argus's calibration (az≈-1g face-up),
+  so axis signs were correct first try.
+- **Motion-wake / auto-dim**: `moving` `on_press` → backlight full (`bl_full` 0.70);
+  `on_release` → `idle_dim` script (restart-mode, `idle_timeout` 90s) fades to
+  `bl_dim` 0.12. Confirmed on glass.
+- **Midnight reckoning**: `time.on_time` 00:00 → `lvgl.page.show ephemeris`
+  (on_load refreshes + holds). Wired; not yet seen fire (next test: temp near-time
+  cron if desired).
+- **Drill-in (any constellation)**: tapping a constellation on the Night Sky
+  (within ~90px of its centroid, `oracle::constellation_at`) shows the new
+  `ascendant_drill` page (`skip: true` — off the pager) with that god's models as
+  stars sized by token share. `drill_god` global selects the god; tap returns.
+  Gods with no today data fall through to paging (nothing to drill).
+- **API extended** (`api/token_oracle_api.py`): each `/metrics` node now carries
+  its own today `models[]` (top-5, tokens desc) via a new `oracle:node_models`
+  query + `_node_models()`. Firmware parses `nodes[].models` into per-god tables
+  (`g_node_models[6][8]`). `max_response_buffer_size` 4096→8192 for the larger
+  payload. Tests updated (`test_token_oracle_api.py`): 8 passed.
+- Initial drill attempt only triggered for the *live* ascendant (center-tap),
+  which was usually null → felt broken; touch-coordinate logging confirmed coords
+  were correct and the issue was just `ascendant==0`. Reworked to per-node data so
+  any god with today's tokens is drillable (user-chosen; needed the API change).
+- Verdigris now correctly marks the live ascendant's constellation on the Night
+  Sky (pulse) and the drill center glow only when that god is live.
+- Verification: API tests green; firmware `config`/`compile` clean (RAM ~20%,
+  Flash 16.1%); OTA flashed, clean boots; drill into Athena/Metis confirmed on
+  glass after the API deploy. IMU `debug` left off.
 
 ### 2026-06-02 — Phase 3 The Three Faces
 
