@@ -232,8 +232,11 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
             )
             recent_rows = await cur.fetchall()
 
-            ascendant = str(recent_rows[0][0]) if recent_rows else None
-            if ascendant is not None:
+            # Keep the raw (un-normalized) node_id for the SQL lookup so the
+            # model breakdown still matches stored rows; the payload exposes
+            # the canonical spelling (see below).
+            ascendant_raw = str(recent_rows[0][0]) if recent_rows else None
+            if ascendant_raw is not None:
                 await cur.execute(
                     f"""
                     /* oracle:models */
@@ -246,7 +249,7 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
                     GROUP BY model
                     ORDER BY COALESCE(SUM(total_tokens), 0) DESC, model ASC
                     """,
-                    [today_start, tomorrow_start, ascendant],
+                    [today_start, tomorrow_start, ascendant_raw],
                 )
                 model_rows = await cur.fetchall()
             else:
@@ -267,10 +270,26 @@ async def build_metrics(pool, cfg: OracleConfig, now: datetime) -> dict[str, Any
             )
             daily_rows = await cur.fetchall()
 
+    # Fold node_id casing onto the configured spelling so the device's
+    # case-sensitive name matching always sees canonical names. A sidecar that
+    # writes e.g. "Mnemosyne" must still land on the "mnemosyne" face instead
+    # of riding along as a stray, unmatched node. Unknown nodes pass through.
+    canon = _canonical_lookup(cfg.nodes)
+    node_totals: dict[str, int] = {}
+    for node, tokens in node_rows:
+        name = _canon_node(str(node), canon)
+        node_totals[name] = node_totals.get(name, 0) + int(tokens or 0)
+    node_rows = list(node_totals.items())
+    node_model_rows = [
+        (_canon_node(str(node), canon), model, tokens)
+        for node, model, tokens in node_model_rows
+    ]
+    ascendant = _canon_node(ascendant_raw, canon) if ascendant_raw is not None else None
+
     hourly = _hourly(hourly_rows)
     zenith_hour, zenith_tokens = _zenith(hourly)
     first, last = _span(span_row)
-    live_nodes = {str(row[0]) for row in recent_rows}
+    live_nodes = {_canon_node(str(row[0]), canon) for row in recent_rows}
     recent_total = sum(int(row[1] or 0) for row in recent_rows)
     rate_per_min = int(round(recent_total / (cfg.ascendant_window_seconds / 60)))
     today_total = int(total or 0)
@@ -379,6 +398,20 @@ def _nodes(
         }
         for name in names
     ]
+
+
+def _canonical_lookup(configured: tuple[str, ...]) -> dict[str, str]:
+    """Map a lowercased node name to its configured (canonical) spelling."""
+    return {name.lower(): name for name in configured}
+
+
+def _canon_node(name: str, lookup: dict[str, str]) -> str:
+    """Fold a raw node_id onto its configured spelling, case-insensitively.
+
+    Nodes not in the configured allow-list pass through unchanged so the API
+    still degrades gracefully against node-naming / schema drift.
+    """
+    return lookup.get(name.lower(), name)
 
 
 def _node_models(rows: list[tuple], limit: int = 5) -> dict[str, list[dict[str, Any]]]:

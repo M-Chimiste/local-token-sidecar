@@ -164,14 +164,44 @@ Hardware validation:
   but API dimming has not been explicitly exercised.
 - `today.total` polling is validated at `0`; a nonzero live-change acceptance
   check still needs a metrics value change.
-- Validate real data shape: unknown `node_id` values append after configured
-  gods; check whether that is acceptable before firmware layout is locked.
+- ~~Validate real data shape: unknown `node_id` values append after configured
+  gods; check whether that is acceptable before firmware layout is locked.~~
+  **Resolved 2026-06-07** — case-variant ids (`Mnemosyne` vs `mnemosyne`) were
+  appending as stray nodes and the device dropped them. The metrics API now
+  folds case onto the configured spelling (see Session Log). Genuinely-unknown
+  node ids still append; the firmware only renders the five configured gods.
 - Phase 0 intentionally omits ill-omen and today-vs-yesterday fields because
   they are not in the §4 `/metrics` wire contract.
 
 ---
 
 ## Session Log
+
+### 2026-06-07 — Bugfix: node_id case mismatch dropped Mnemosyne on the device
+
+- **Symptom**: the dashboard showed Mnemosyne token activity but the ESP32 face
+  read 0 for Mnemosyne. Root cause: the Mnemosyne sidecar writes its `node_id`
+  as `Mnemosyne` (capitalized), while the firmware matches node names with
+  case-sensitive `strcmp(nm, "mnemosyne")` ([token-oracle.yaml:1501](../token-oracle/firmware/token-oracle.yaml#L1501),
+  ascendant at [:1521](../token-oracle/firmware/token-oracle.yaml#L1521)). The
+  metrics API doesn't filter by node, so `_nodes()` appended `Mnemosyne` as a
+  stray 6th node (confirmed live: `nodes` names were
+  `[nyx, mnemosyne, athena, metis, theseus, Mnemosyne]`). This is the realization
+  of the prior "unknown node_id appends after configured gods" watch item.
+- **Fix (server-side, per AGENTS.md "treat node_id as configurable / degrade
+  gracefully")**: `api/token_oracle_api.py` now folds raw `node_id` onto the
+  configured `oracle.nodes` spelling case-insensitively (`_canonical_lookup` /
+  `_canon_node`), aggregating totals/models/live and normalizing `ascendant`.
+  The raw id is retained for the ascendant per-model SQL lookup so it still
+  matches stored rows. Unknown nodes still pass through unchanged. Fixes
+  historical + future data with no firmware reflash. New regression test
+  `test_metrics_folds_node_id_casing`; `tests/test_token_oracle_api.py` green (9).
+- **Deploy still required**: the live API on `nyx` runs the old code — pull this
+  change onto `nyx` and restart `com.athena.token-oracle-api`, then re-check
+  `GET http://Nyx.local:8090/metrics` shows no stray `Mnemosyne` entry.
+- Considered but not done: also lowercasing the Mnemosyne sidecar's `node.id`
+  for dashboard consistency (user chose API-only). Worth a follow-up if the
+  capitalized name in the dashboard is bothersome.
 
 ### 2026-06-03 — Phase 4 Interaction (IMU, motion-wake, drill-in, midnight)
 

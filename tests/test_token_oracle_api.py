@@ -299,6 +299,43 @@ async def test_metrics_idle_when_no_recent_activity(aiohttp_client):
     assert all(node["live"] is False for node in j["nodes"])
 
 
+async def test_metrics_folds_node_id_casing(aiohttp_client):
+    """A sidecar writing a non-canonical 'Mnemosyne' must fold onto the
+    configured lowercase 'mnemosyne' face the device matches against, instead
+    of riding along as a stray, unmatched extra node."""
+    pool = FakePool([
+        _row("c1", datetime(2026, 6, 2, 14, 20, tzinfo=timezone.utc), "Mnemosyne", "minimax", 300, 200, 500),
+        _row("c2", datetime(2026, 6, 2, 14, 30, tzinfo=timezone.utc), "Mnemosyne", "qwen", 200, 100, 300),
+        _row("c3", datetime(2026, 6, 2, 13, 0, tzinfo=timezone.utc), "athena", "gemma", 140, 60, 200),
+    ])
+    app = token_oracle_api.create_app(
+        _cfg(),
+        pool_factory=lambda: pool,
+        now_factory=lambda: NOW,
+    )
+    client = await aiohttp_client(app)
+    j = await (await client.get("/metrics")).json()
+
+    names = [node["name"] for node in j["nodes"]]
+    assert names == ["nyx", "mnemosyne", "athena", "metis"]
+    assert "Mnemosyne" not in names
+
+    by_name = {node["name"]: node for node in j["nodes"]}
+    assert by_name["mnemosyne"]["total"] == 800
+    assert by_name["mnemosyne"]["live"] is True
+    assert by_name["mnemosyne"]["models"] == [
+        {"name": "minimax", "total": 500},
+        {"name": "qwen", "total": 300},
+    ]
+    # ascendant is normalized for the device, and its model breakdown still
+    # resolves because the raw id is used for that lookup.
+    assert j["ascendant"] == "mnemosyne"
+    assert j["models"] == [
+        {"name": "minimax", "total": 500},
+        {"name": "qwen", "total": 300},
+    ]
+
+
 async def test_metrics_empty_db_returns_safe_defaults(aiohttp_client):
     app = token_oracle_api.create_app(
         _cfg(),

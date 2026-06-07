@@ -28,12 +28,13 @@ Other invariants worth knowing:
 - **LaunchAgent label is `com.athena.token-sidecar`** and the plist is regenerated from `config.yaml` by [setup_launchd.py](setup_launchd.py). When central sync is enabled, the install step copies the configured DSN env var from the current shell into the plist (mode `0600`); plain-cfg installs use mode `0644`.
 - **The catch-all proxy route** ([sidecar.py:273-274](sidecar.py#L273-L274)) forwards any unmatched GET/POST to upstream and will still extract `usage` if the response happens to be an OpenAI-shaped JSON dict — useful for tracking endpoints we haven't explicitly listed.
 
-## Token Oracle (hardware dashboard — Phase 0 API built)
+## Token Oracle (hardware dashboard — Phases 0–4 live on hardware, Phase 5 polish remains)
 
-The `hardware-dashboard` branch adds **Token Oracle**: a round 480×480 ESP32-S3 touch display that renders fleet token usage as a Greek "pantheon" of three faces (Night Sky, Pantheon, Ephemeris). Phase 0 data plumbing lives in [api/token_oracle_api.py](api/token_oracle_api.py); firmware, board bring-up, and rendered faces are still future phases. `project_docs/` remains the visual/product spec.
+The `hardware-dashboard` branch adds **Token Oracle**: a round 480×480 ESP32-S3 touch display that renders fleet token usage as a Greek "pantheon" of three faces (Night Sky, Pantheon, Ephemeris). The metrics API runs on `nyx` and the firmware renders all three faces with live data and IMU-driven interaction; only Phase 5 (polish) is open. Track exact phase state in [project_docs/project_status.md](project_docs/project_status.md), which is the source of truth and **must be updated at the end of every Oracle-touching session**; `project_docs/` remains the visual/product spec.
 
-- **Metrics API** — a read-only aiohttp + psycopg_pool service on `nyx`, co-located with Postgres and run under launchd. Serves `GET /metrics` (the aggregated JSON in [implementation-plan.md §4](project_docs/implementation-plan.md)) and `GET /health`. Same-day fields aggregate over local-day UTC bounds; history fields (`trend`, `high_water`, `streak_days`) are computed on the fly for v1.
-- **Firmware** — ESPHome + LVGL for the Waveshare ESP32-S3-Touch-LCD-2.8C (verified pin map in [implementation-plan.md §3](project_docs/implementation-plan.md)).
+- **Metrics API** — [api/token_oracle_api.py](api/token_oracle_api.py), a read-only aiohttp + psycopg_pool service on `nyx`, co-located with Postgres and run under launchd (label `com.athena.token-oracle-api`, default port `8090`, DSN from `TOKEN_SIDECAR_QUERY_DSN`). Serves `GET /metrics` (the aggregated JSON in [implementation-plan.md §4](project_docs/implementation-plan.md)) and `GET /health`. Same-day fields aggregate over local-day UTC bounds; history fields (`trend`, `high_water`, `streak_days`) are computed on the fly for v1. Runtime query failures soft-fail `/metrics` with HTTP 200 + `ok:false` and parseable zero defaults — the device must always get a parseable document. Config is the `oracle:` block in [config.yaml](config.yaml) (`OracleConfig`), including the explicit `nodes:` allow-list.
+- **Firmware** — [token-oracle/firmware/](token-oracle/firmware/), ESPHome + LVGL for the Waveshare ESP32-S3-Touch-LCD-2.8C, polling `http://Nyx.local:8090/metrics`. Each face is an `lv_canvas` drawn by one per-frame C++ lambda (LVGL 9 layer API) from pure geometry tables in `oracle_faces.h`; a ~10fps interval re-renders only the active face. Pure math/data helpers are LVGL-free in `oracle_faces.h` + `token_dash_helpers.h` (pulled in via `esphome: includes:`). Two hardware drivers are **local ESPHome component overrides** ported from the Argus stack: `components/st7701s/` (480×480 RGB panel; double framebuffer + bounce buffer) and `components/qmi8658/` (I2C IMU at `0x6B` → motion-wake / auto-dim). Verified pin map in [implementation-plan.md §3](project_docs/implementation-plan.md).
+  - **Firmware gotchas (hard-won — also in auto-memory):** display needs `color_order: RGB` (BGR swaps red/blue → gold renders cyan); `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` + `CONFIG_SPIRAM_RODATA` prevent a "Cache error" crash from the RGB bounce ISR faulting during flash ops; after flashing, verify the running build via the `app:153` log line because OTA can silently roll back (USB `--device /dev/cu.usbmodem...` is the fallback). `esphome compile` needs network access (fonts come from `gfonts://`). Wi-Fi values live in `secrets.yaml` (git-ignored; copy from `secrets.example.yaml`), never in repo files. Do not flash, OTA, or touch hardware without an explicit ask.
 
 Claude-specific things to hold onto:
 
@@ -64,6 +65,13 @@ uv run python -m queries.summary daily --backend postgres --node athena --format
 
 # LaunchAgent (macOS user scope only — never run as root)
 uv run python setup_launchd.py install | status | unload | remove
+# Sibling read-only services share setup_launchd.py via --service:
+uv run python setup_launchd.py install --service dashboard   # label com.athena.token-sidecar-dashboard
+uv run python setup_launchd.py install --service oracle      # label com.athena.token-oracle-api (port 8090, needs TOKEN_SIDECAR_QUERY_DSN)
+
+# Run the read-only services in foreground (Postgres box; DSN in env)
+uv run python dashboard.py                 # React dashboard + JSON aggregates (dashboard.listen_port)
+uv run python -m api.token_oracle_api      # Token Oracle /metrics + /health (oracle.listen_port 8090)
 
 # One-step installer (handles deps, db init, plist, optional launchd load)
 ./install.sh [--force]
